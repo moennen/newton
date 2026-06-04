@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Add `soft_contact_max` to `SolverVBD` so body-particle contact buffers can be sized consistently with `CollisionPipeline`.
+
+### Fixed
+
+- Fix particle-shape soft-contact allocation and generation for replicated worlds by using world-aware shape candidates instead of global all-pairs sizing.
+
 ## [1.2.0] - 2026-05-12
 
 ### Added

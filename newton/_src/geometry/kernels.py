@@ -1001,6 +1001,82 @@ def counter_increment_replay(
     return -1
 
 
+@wp.func
+def eval_soft_contact_shape_sdf(
+    geo_type: int,
+    x_local: wp.vec3,
+    geo_scale: wp.vec3,
+    shape_index: int,
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_heightfield_index: wp.array[wp.int32],
+    heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[wp.float32],
+    margin: float,
+    radius: float,
+):
+    d = 1.0e6
+    n = wp.vec3()
+    v = wp.vec3()
+
+    if geo_type == GeoType.SPHERE:
+        d = sdf_sphere(x_local, geo_scale[0])
+        n = sdf_sphere_grad(x_local, geo_scale[0])
+
+    if geo_type == GeoType.BOX:
+        d = sdf_box(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+        n = sdf_box_grad(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+
+    if geo_type == GeoType.CAPSULE:
+        d = sdf_capsule(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_capsule_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.CYLINDER:
+        d = sdf_cylinder(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_cylinder_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.CONE:
+        d = sdf_cone(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_cone_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.ELLIPSOID:
+        d = sdf_ellipsoid(x_local, geo_scale)
+        n = sdf_ellipsoid_grad(x_local, geo_scale)
+
+    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
+        mesh = shape_source_ptr[shape_index]
+
+        face_index = int(0)
+        face_u = float(0.0)
+        face_v = float(0.0)
+        sign = float(0.0)
+
+        min_scale = wp.min(geo_scale)
+        if wp.mesh_query_point_sign_normal(
+            mesh, wp.cw_div(x_local, geo_scale), margin + radius / min_scale, sign, face_index, face_u, face_v
+        ):
+            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
+            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
+
+            shape_p = wp.cw_mul(shape_p, geo_scale)
+            shape_v = wp.cw_mul(shape_v, geo_scale)
+
+            delta = x_local - shape_p
+
+            d = wp.length(delta) * sign
+            n = wp.normalize(delta) * sign
+            v = shape_v
+
+    if geo_type == GeoType.PLANE:
+        d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
+        n = wp.vec3(0.0, 0.0, 1.0)
+
+    if geo_type == GeoType.HFIELD:
+        hfd = heightfield_data[shape_heightfield_index[shape_index]]
+        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
+
+    return d, n, v
+
+
 @wp.kernel
 def create_soft_contacts(
     particle_q: wp.array[wp.vec3],
@@ -1066,66 +1142,18 @@ def create_soft_contacts(
     geo_type = shape_type[shape_index]
     geo_scale = shape_scale[shape_index]
 
-    # evaluate shape sdf
-    d = 1.0e6
-    n = wp.vec3()
-    v = wp.vec3()
-
-    if geo_type == GeoType.SPHERE:
-        d = sdf_sphere(x_local, geo_scale[0])
-        n = sdf_sphere_grad(x_local, geo_scale[0])
-
-    if geo_type == GeoType.BOX:
-        d = sdf_box(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
-        n = sdf_box_grad(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
-
-    if geo_type == GeoType.CAPSULE:
-        d = sdf_capsule(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_capsule_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.CYLINDER:
-        d = sdf_cylinder(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_cylinder_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.CONE:
-        d = sdf_cone(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_cone_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.ELLIPSOID:
-        d = sdf_ellipsoid(x_local, geo_scale)
-        n = sdf_ellipsoid_grad(x_local, geo_scale)
-
-    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
-        mesh = shape_source_ptr[shape_index]
-
-        face_index = int(0)
-        face_u = float(0.0)
-        face_v = float(0.0)
-        sign = float(0.0)
-
-        min_scale = wp.min(geo_scale)
-        if wp.mesh_query_point_sign_normal(
-            mesh, wp.cw_div(x_local, geo_scale), margin + radius / min_scale, sign, face_index, face_u, face_v
-        ):
-            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
-            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
-
-            shape_p = wp.cw_mul(shape_p, geo_scale)
-            shape_v = wp.cw_mul(shape_v, geo_scale)
-
-            delta = x_local - shape_p
-
-            d = wp.length(delta) * sign
-            n = wp.normalize(delta) * sign
-            v = shape_v
-
-    if geo_type == GeoType.PLANE:
-        d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
-        n = wp.vec3(0.0, 0.0, 1.0)
-
-    if geo_type == GeoType.HFIELD:
-        hfd = heightfield_data[shape_heightfield_index[shape_index]]
-        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
+    d, n, v = eval_soft_contact_shape_sdf(
+        geo_type,
+        x_local,
+        geo_scale,
+        shape_index,
+        shape_source_ptr,
+        shape_heightfield_index,
+        heightfield_data,
+        heightfield_elevations,
+        margin,
+        radius,
+    )
 
     if d < margin + radius:
         index = counter_increment(soft_contact_count, 0, soft_contact_tids, tid, soft_contact_max)
@@ -1223,66 +1251,18 @@ def create_soft_contacts_from_shape_candidates(
     geo_type = shape_type[shape_index]
     geo_scale = shape_scale[shape_index]
 
-    # evaluate shape sdf
-    d = 1.0e6
-    n = wp.vec3()
-    v = wp.vec3()
-
-    if geo_type == GeoType.SPHERE:
-        d = sdf_sphere(x_local, geo_scale[0])
-        n = sdf_sphere_grad(x_local, geo_scale[0])
-
-    if geo_type == GeoType.BOX:
-        d = sdf_box(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
-        n = sdf_box_grad(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
-
-    if geo_type == GeoType.CAPSULE:
-        d = sdf_capsule(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_capsule_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.CYLINDER:
-        d = sdf_cylinder(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_cylinder_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.CONE:
-        d = sdf_cone(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-        n = sdf_cone_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
-
-    if geo_type == GeoType.ELLIPSOID:
-        d = sdf_ellipsoid(x_local, geo_scale)
-        n = sdf_ellipsoid_grad(x_local, geo_scale)
-
-    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
-        mesh = shape_source_ptr[shape_index]
-
-        face_index = int(0)
-        face_u = float(0.0)
-        face_v = float(0.0)
-        sign = float(0.0)
-
-        min_scale = wp.min(geo_scale)
-        if wp.mesh_query_point_sign_normal(
-            mesh, wp.cw_div(x_local, geo_scale), margin + radius / min_scale, sign, face_index, face_u, face_v
-        ):
-            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
-            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
-
-            shape_p = wp.cw_mul(shape_p, geo_scale)
-            shape_v = wp.cw_mul(shape_v, geo_scale)
-
-            delta = x_local - shape_p
-
-            d = wp.length(delta) * sign
-            n = wp.normalize(delta) * sign
-            v = shape_v
-
-    if geo_type == GeoType.PLANE:
-        d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
-        n = wp.vec3(0.0, 0.0, 1.0)
-
-    if geo_type == GeoType.HFIELD:
-        hfd = heightfield_data[shape_heightfield_index[shape_index]]
-        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
+    d, n, v = eval_soft_contact_shape_sdf(
+        geo_type,
+        x_local,
+        geo_scale,
+        shape_index,
+        shape_source_ptr,
+        shape_heightfield_index,
+        heightfield_data,
+        heightfield_elevations,
+        margin,
+        radius,
+    )
 
     if d < margin + radius:
         candidate_tid = particle_index * max_shape_candidates + shape_slot

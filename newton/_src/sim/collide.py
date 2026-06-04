@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import numpy as np
@@ -423,7 +424,9 @@ def _build_soft_contact_shape_candidate_map(model: Model, device) -> tuple[wp.ar
     Each regular world row contains collidable local shapes for that world plus
     collidable global shapes (``shape_world == -1``).  The final row is used by
     global particles and contains all collidable shapes only when global
-    particles are present.
+    particles are present.  Global particles therefore make the table as wide as
+    the full collidable-shape set; replicated Isaac Lab scenes use local
+    particles, so their launch width remains per-world.
     """
     shape_world = getattr(model, "shape_world", None)
     particle_world = getattr(model, "particle_world", None)
@@ -583,7 +586,12 @@ class CollisionPipeline:
                 scenes with large/complex meshes or heightfields report
                 triangle-pair overflow warnings.
             soft_contact_max: Maximum number of soft contacts to allocate.
-                If None, computed as shape_count * particle_count.
+                If None, computed from the active soft-contact candidate space:
+                ``particle_count * max_shapes_per_world`` when finalized world
+                metadata is available, otherwise ``shape_count * particle_count``.
+                If explicitly smaller than that candidate space, excess contacts
+                are dropped after the cap and a warning is emitted during
+                pipeline construction.
             soft_contact_margin: Margin for soft contact generation. Defaults to 0.01.
             requires_grad: Whether to enable gradient computation. If None, uses model.requires_grad.
             broad_phase:
@@ -885,11 +893,20 @@ class CollisionPipeline:
             self._soft_max_shape_candidates = 0
             self._soft_global_particle_candidate_row = -1
 
+        soft_candidate_space = (
+            particle_count * self._soft_max_shape_candidates
+            if self._soft_max_shape_candidates > 0
+            else shape_count * particle_count
+        )
         if soft_contact_max is None:
-            if self._soft_max_shape_candidates > 0:
-                soft_contact_max = particle_count * self._soft_max_shape_candidates
-            else:
-                soft_contact_max = shape_count * particle_count
+            soft_contact_max = soft_candidate_space
+        elif soft_candidate_space > 0 and soft_contact_max < soft_candidate_space:
+            warnings.warn(
+                "CollisionPipeline soft_contact_max is smaller than the static soft-contact candidate space "
+                f"({soft_contact_max} < {soft_candidate_space}); contacts beyond the cap will be dropped.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.soft_contact_margin = soft_contact_margin
         self._soft_contact_max = soft_contact_max
         self.requires_grad = requires_grad
