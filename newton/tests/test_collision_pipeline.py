@@ -10,7 +10,11 @@ import warp.examples
 
 import newton
 from newton import GeoType
-from newton._src.sim.collide import _compute_per_world_shape_pairs_max, _estimate_rigid_contact_max
+from newton._src.sim.collide import (
+    _build_soft_contact_shape_candidate_map,
+    _compute_per_world_shape_pairs_max,
+    _estimate_rigid_contact_max,
+)
 from newton.examples import test_body_state
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
@@ -976,6 +980,46 @@ class TestShapePairsMaxScaling(unittest.TestCase):
                 global_quadratic / 10,
                 f"broad_phase={bp_mode}: shape_pairs_max must not be quadratic",
             )
+
+    def test_soft_contact_shape_candidate_map_is_world_aware(self):
+        """Soft-contact candidates include local plus global shapes per particle world."""
+        from newton._src.geometry.flags import ShapeFlags  # noqa: PLC0415
+
+        model = newton.Model()
+        model.world_count = 3
+        model.shape_count = 7
+        model.particle_count = 5
+        model.shape_world = wp.array(np.array([-1, 0, 0, 1, 1, 2, 2], dtype=np.int32), dtype=wp.int32)
+        model.particle_world = wp.array(np.array([0, 0, 1, 2, -1], dtype=np.int32), dtype=wp.int32)
+        model.shape_flags = wp.array(
+            np.array(
+                [
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    0,
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    0,
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                ],
+                dtype=np.int32,
+            ),
+            dtype=wp.int32,
+        )
+
+        result = _build_soft_contact_shape_candidate_map(model, wp.get_device("cpu"))
+        self.assertIsNotNone(result)
+        candidate_indices, candidate_counts, max_candidates, global_particle_row = result
+
+        self.assertEqual(max_candidates, 5)
+        self.assertEqual(global_particle_row, 3)
+        np.testing.assert_array_equal(candidate_counts.numpy(), np.array([2, 3, 2, 5], dtype=np.int32))
+
+        table = candidate_indices.numpy().reshape((4, max_candidates))
+        np.testing.assert_array_equal(table[0], np.array([0, 1, -1, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[1], np.array([0, 3, 4, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[2], np.array([0, 6, -1, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[3], np.array([0, 1, 3, 4, 6], dtype=np.int32))
 
 
 def test_particle_shape_contacts(test, device, shape_type: GeoType):

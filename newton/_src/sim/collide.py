@@ -16,7 +16,7 @@ from ..geometry.contact_match import ContactMatcher
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import ShapeFlags
-from ..geometry.kernels import create_soft_contacts
+from ..geometry.kernels import create_soft_contacts, create_soft_contacts_from_shape_candidates
 from ..geometry.narrow_phase import NarrowPhase
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.support_function import (
@@ -417,6 +417,66 @@ def _compute_per_world_shape_pairs_max(model: Model) -> int:
     return max(0, total)
 
 
+def _build_soft_contact_shape_candidate_map(model: Model, device) -> tuple[wp.array, wp.array, int, int] | None:
+    """Build per-world shape candidate rows for particle-shape soft contacts.
+
+    Each regular world row contains collidable local shapes for that world plus
+    collidable global shapes (``shape_world == -1``).  The final row is used by
+    global particles and contains all collidable shapes only when global
+    particles are present.
+    """
+    shape_world = getattr(model, "shape_world", None)
+    particle_world = getattr(model, "particle_world", None)
+    world_count = int(getattr(model, "world_count", 0) or 0)
+    if shape_world is None or particle_world is None or world_count <= 0 or model.shape_count <= 0:
+        return None
+
+    shape_world_np = shape_world.numpy()
+    if len(shape_world_np) != model.shape_count:
+        return None
+
+    shape_flags = getattr(model, "shape_flags", None)
+    if shape_flags is not None:
+        shape_flags_np = shape_flags.numpy()
+        colliding = (shape_flags_np & int(ShapeFlags.COLLIDE_PARTICLES)) != 0
+    else:
+        colliding = np.ones(model.shape_count, dtype=bool)
+
+    global_shapes = np.nonzero((shape_world_np == -1) & colliding)[0].astype(np.int32)
+    rows: list[np.ndarray] = []
+    for world_id in range(world_count):
+        local_shapes = np.nonzero((shape_world_np == world_id) & colliding)[0].astype(np.int32)
+        if len(global_shapes) > 0:
+            row = np.concatenate((global_shapes, local_shapes))
+        else:
+            row = local_shapes
+        rows.append(row)
+
+    particle_world_np = particle_world.numpy()
+    global_particle_candidate_row = world_count
+    if np.any(particle_world_np < 0):
+        rows.append(np.nonzero(colliding)[0].astype(np.int32))
+    else:
+        rows.append(np.zeros(0, dtype=np.int32))
+
+    max_shape_candidates = max((len(row) for row in rows), default=0)
+    if max_shape_candidates <= 0:
+        return None
+
+    table = np.full((len(rows), max_shape_candidates), -1, dtype=np.int32)
+    counts = np.zeros(len(rows), dtype=np.int32)
+    for row_id, row in enumerate(rows):
+        counts[row_id] = len(row)
+        if len(row) > 0:
+            table[row_id, : len(row)] = row
+
+    with wp.ScopedDevice(device):
+        shape_candidate_indices = wp.array(table.reshape(-1), dtype=wp.int32, device=device)
+        shape_candidate_counts = wp.array(counts, dtype=wp.int32, device=device)
+
+    return shape_candidate_indices, shape_candidate_counts, max_shape_candidates, global_particle_candidate_row
+
+
 def _resolve_shape_pairs_max(model: Model, override: int | None) -> int:
     """Pick the broad-phase candidate-pair buffer capacity.
 
@@ -811,8 +871,25 @@ class CollisionPipeline:
                 f"(expected {shape_count}, got {self.narrow_phase.shape_aabb_upper.shape[0]})"
             )
 
+        soft_shape_candidate_map = _build_soft_contact_shape_candidate_map(model, device)
+        if soft_shape_candidate_map is not None:
+            (
+                self._soft_shape_candidate_indices,
+                self._soft_shape_candidate_counts,
+                self._soft_max_shape_candidates,
+                self._soft_global_particle_candidate_row,
+            ) = soft_shape_candidate_map
+        else:
+            self._soft_shape_candidate_indices = None
+            self._soft_shape_candidate_counts = None
+            self._soft_max_shape_candidates = 0
+            self._soft_global_particle_candidate_row = -1
+
         if soft_contact_max is None:
-            soft_contact_max = shape_count * particle_count
+            if self._soft_max_shape_candidates > 0:
+                soft_contact_max = particle_count * self._soft_max_shape_candidates
+            else:
+                soft_contact_max = shape_count * particle_count
         self.soft_contact_margin = soft_contact_margin
         self._soft_contact_max = soft_contact_max
         self.requires_grad = requires_grad
@@ -1194,37 +1271,76 @@ class CollisionPipeline:
         # Generate soft contacts for particles and shapes
         particle_count = len(state.particle_q) if state.particle_q else 0
         if state.particle_q and model.shape_count > 0:
-            wp.launch(
-                kernel=create_soft_contacts,
-                dim=particle_count * model.shape_count,
-                inputs=[
-                    state.particle_q,
-                    model.particle_radius,
-                    model.particle_flags,
-                    model.particle_world,
-                    state.body_q,
-                    model.shape_transform,
-                    model.shape_body,
-                    model.shape_type,
-                    model.shape_scale,
-                    model.shape_source_ptr,
-                    model.shape_world,
-                    soft_contact_margin,
-                    self.soft_contact_max,
-                    model.shape_count,
-                    model.shape_flags,
-                    model.shape_heightfield_index,
-                    model.heightfield_data,
-                    model.heightfield_elevations,
-                ],
-                outputs=[
-                    contacts.soft_contact_count,
-                    contacts.soft_contact_particle,
-                    contacts.soft_contact_shape,
-                    contacts.soft_contact_body_pos,
-                    contacts.soft_contact_body_vel,
-                    contacts.soft_contact_normal,
-                    contacts.soft_contact_tids,
-                ],
-                device=self.device,
-            )
+            if self._soft_shape_candidate_indices is not None and self._soft_max_shape_candidates > 0:
+                wp.launch(
+                    kernel=create_soft_contacts_from_shape_candidates,
+                    dim=(particle_count, self._soft_max_shape_candidates),
+                    inputs=[
+                        state.particle_q,
+                        model.particle_radius,
+                        model.particle_flags,
+                        model.particle_world,
+                        state.body_q,
+                        model.shape_transform,
+                        model.shape_body,
+                        model.shape_type,
+                        model.shape_scale,
+                        model.shape_source_ptr,
+                        model.shape_world,
+                        self._soft_shape_candidate_indices,
+                        self._soft_shape_candidate_counts,
+                        self._soft_max_shape_candidates,
+                        self._soft_global_particle_candidate_row,
+                        soft_contact_margin,
+                        self.soft_contact_max,
+                        model.shape_flags,
+                        model.shape_heightfield_index,
+                        model.heightfield_data,
+                        model.heightfield_elevations,
+                    ],
+                    outputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_particle,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_tids,
+                    ],
+                    device=self.device,
+                )
+            else:
+                wp.launch(
+                    kernel=create_soft_contacts,
+                    dim=particle_count * model.shape_count,
+                    inputs=[
+                        state.particle_q,
+                        model.particle_radius,
+                        model.particle_flags,
+                        model.particle_world,
+                        state.body_q,
+                        model.shape_transform,
+                        model.shape_body,
+                        model.shape_type,
+                        model.shape_scale,
+                        model.shape_source_ptr,
+                        model.shape_world,
+                        soft_contact_margin,
+                        self.soft_contact_max,
+                        model.shape_count,
+                        model.shape_flags,
+                        model.shape_heightfield_index,
+                        model.heightfield_data,
+                        model.heightfield_elevations,
+                    ],
+                    outputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_particle,
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_body_vel,
+                        contacts.soft_contact_normal,
+                        contacts.soft_contact_tids,
+                    ],
+                    device=self.device,
+                )
