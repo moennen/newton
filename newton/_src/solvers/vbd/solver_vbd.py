@@ -234,6 +234,7 @@ class SolverVBD(SolverBase):
         rigid_contact_k_start: float = 1.0e2,  # Body-body/body-particle penalty seed when ramping is enabled
         rigid_body_contact_buffer_size: int = 64,  # Per-body body-body contact list capacity
         rigid_body_particle_contact_buffer_size: int = 256,  # Per-body particle-contact list capacity
+        soft_contact_max: int | None = None,  # Body-particle material buffer capacity; None uses full nxn size
         # Rigid body - joints
         rigid_joint_linear_ke: float = 1.0e5,  # Penalty stiffness ceiling for structural linear joint constraints
         rigid_joint_angular_ke: float = 1.0e5,  # Penalty stiffness ceiling for structural angular joint constraints
@@ -336,6 +337,11 @@ class SolverVBD(SolverBase):
                 When the linear beta is 0, k is fixed at the contact stiffness regardless of this value.
             rigid_body_contact_buffer_size: Max body-body contacts per rigid body for per-body contact lists.
             rigid_body_particle_contact_buffer_size: Max body-particle contacts tracked per rigid body.
+            soft_contact_max: Optional body-particle contact capacity used to preallocate VBD material buffers.
+                When omitted, the solver preserves the legacy full particle-shape candidate capacity
+                ``model.shape_count * model.particle_count``. Pass the same explicit cap used by
+                ``CollisionPipeline(..., soft_contact_max=...)`` to avoid oversized allocations and CUDA graph
+                recapture/resizing in large replicated scenes.
             rigid_joint_linear_ke: Penalty stiffness ceiling for non-cable structural linear joint slots.
             rigid_joint_angular_ke: Penalty stiffness ceiling for non-cable structural angular joint slots.
             rigid_joint_linear_k_start: Linear penalty seed for AVBD ramping. Used when
@@ -416,6 +422,7 @@ class SolverVBD(SolverBase):
             rigid_contact_k_start,
             rigid_body_contact_buffer_size,
             rigid_body_particle_contact_buffer_size,
+            soft_contact_max,
             rigid_joint_linear_ke,
             rigid_joint_angular_ke,
             rigid_joint_linear_k_start,
@@ -547,6 +554,7 @@ class SolverVBD(SolverBase):
         rigid_contact_k_start: float,
         rigid_body_contact_buffer_size: int,
         rigid_body_particle_contact_buffer_size: int,
+        soft_contact_max: int | None,
         rigid_joint_linear_ke: float,
         rigid_joint_angular_ke: float,
         rigid_joint_linear_k_start: float,
@@ -734,7 +742,10 @@ class SolverVBD(SolverBase):
         # Zero-length body poses for static-shape contact kernels when State.body_q is absent.
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
         if model.particle_count > 0 and model.shape_count > 0:
-            self._init_body_particle_contact_state(model.shape_count * model.particle_count)
+            body_particle_contact_max = model.shape_count * model.particle_count
+            if soft_contact_max is not None:
+                body_particle_contact_max = min(body_particle_contact_max, max(0, int(soft_contact_max)))
+            self._init_body_particle_contact_state(body_particle_contact_max)
 
         # Kinematic body support: create effective inv_mass / inv_inertia arrays
         # with kinematic bodies zeroed out.

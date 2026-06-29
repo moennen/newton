@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import warnings
 from enum import IntFlag, auto
 
 import numpy as np
@@ -13,7 +14,11 @@ from newton import GeoType
 from newton._src.geometry import create_mesh_terrain
 from newton._src.geometry.flags import ParticleFlags, ShapeFlags
 from newton._src.geometry.kernels import create_soft_contacts, mesh_sdf
-from newton._src.sim.collide import _compute_per_world_shape_pairs_max, _estimate_rigid_contact_max
+from newton._src.sim.collide import (
+    _build_soft_contact_shape_candidate_map,
+    _compute_per_world_shape_pairs_max,
+    _estimate_rigid_contact_max,
+)
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
@@ -1128,6 +1133,10 @@ class TestParticleShapeContacts(unittest.TestCase):
     pass
 
 
+class TestSoftContactWorldCandidates(unittest.TestCase):
+    pass
+
+
 class TestContactEstimator(unittest.TestCase):
     def test_heuristic_caps_large_pair_count(self):
         """When pair count is huge, the heuristic provides a tighter bound."""
@@ -1309,6 +1318,144 @@ class TestShapePairsMaxScaling(unittest.TestCase):
                 global_quadratic / 10,
                 f"broad_phase={bp_mode}: shape_pairs_max must not be quadratic",
             )
+
+    def test_soft_contact_shape_candidate_map_is_world_aware(self):
+        """Soft-contact candidates include local plus global shapes per particle world."""
+        from newton._src.geometry.flags import ShapeFlags  # noqa: PLC0415
+
+        model = newton.Model()
+        model.world_count = 3
+        model.shape_count = 7
+        model.particle_count = 5
+        model.shape_world = wp.array(np.array([-1, 0, 0, 1, 1, 2, 2], dtype=np.int32), dtype=wp.int32)
+        model.particle_world = wp.array(np.array([0, 0, 1, 2, -1], dtype=np.int32), dtype=wp.int32)
+        model.shape_flags = wp.array(
+            np.array(
+                [
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    0,
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                    0,
+                    int(ShapeFlags.COLLIDE_PARTICLES),
+                ],
+                dtype=np.int32,
+            ),
+            dtype=wp.int32,
+        )
+
+        result = _build_soft_contact_shape_candidate_map(model, wp.get_device("cpu"))
+        self.assertIsNotNone(result)
+        candidate_indices, candidate_counts, max_candidates, global_particle_row = result
+
+        self.assertEqual(max_candidates, 5)
+        self.assertEqual(global_particle_row, 3)
+        np.testing.assert_array_equal(candidate_counts.numpy(), np.array([2, 3, 2, 5], dtype=np.int32))
+
+        table = candidate_indices.numpy().reshape((4, max_candidates))
+        np.testing.assert_array_equal(table[0], np.array([0, 1, -1, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[1], np.array([0, 3, 4, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[2], np.array([0, 6, -1, -1, -1], dtype=np.int32))
+        np.testing.assert_array_equal(table[3], np.array([0, 1, 3, 4, 6], dtype=np.int32))
+
+
+def _build_two_world_soft_contact_model(device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    expected_local_shape_by_particle = {}
+
+    for _ in range(2):
+        builder.begin_world()
+        particle = builder.add_particle(pos=(0.0, 0.0, 0.08), vel=(0.0, 0.0, 0.0), mass=1.0, radius=0.05)
+        local_shape = builder.add_shape_sphere(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            radius=0.1,
+        )
+        builder.end_world()
+        expected_local_shape_by_particle[particle] = local_shape
+
+    global_shape = builder.add_shape_sphere(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.16), wp.quat_identity()),
+        radius=0.1,
+    )
+
+    return builder.finalize(device=device), expected_local_shape_by_particle, global_shape
+
+
+def test_soft_contact_generation_is_world_aware(test, device):
+    """Particles collide with local and global shapes, not other worlds' local shapes."""
+    with wp.ScopedDevice(device):
+        model, expected_local_shape_by_particle, global_shape = _build_two_world_soft_contact_model(device)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_margin=0.02)
+        contacts = pipeline.contacts()
+        pipeline.collide(model.state(), contacts)
+
+        soft_count = int(contacts.soft_contact_count.numpy()[0])
+        test.assertEqual(soft_count, 4)
+
+        actual_shapes_by_particle = {particle: set() for particle in expected_local_shape_by_particle}
+        particles = contacts.soft_contact_particle.numpy()[:soft_count]
+        shapes = contacts.soft_contact_shape.numpy()[:soft_count]
+        for particle, shape in zip(particles, shapes, strict=True):
+            actual_shapes_by_particle[int(particle)].add(int(shape))
+
+        for particle, local_shape in expected_local_shape_by_particle.items():
+            test.assertEqual(actual_shapes_by_particle[particle], {local_shape, global_shape})
+
+
+def test_soft_contact_cap_warns_and_bounds_writes(test, device):
+    """Explicit caps smaller than the candidate space stay memory-safe."""
+    with wp.ScopedDevice(device):
+        model, expected_local_shape_by_particle, global_shape = _build_two_world_soft_contact_model(device)
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            pipeline = newton.CollisionPipeline(
+                model,
+                broad_phase="nxn",
+                soft_contact_margin=0.02,
+                soft_contact_max=1,
+            )
+
+        test.assertTrue(
+            any("static soft-contact candidate space" in str(item.message) for item in captured),
+            "Expected a warning when soft_contact_max is below the static candidate space",
+        )
+        test.assertEqual(pipeline.soft_contact_max, 1)
+
+        state = model.state()
+        contacts = pipeline.contacts()
+
+        if wp.get_device(device).is_cuda:
+            with wp.ScopedCapture() as capture:
+                pipeline.collide(state, contacts)
+            wp.capture_launch(capture.graph)
+        else:
+            pipeline.collide(state, contacts)
+
+        soft_count = int(contacts.soft_contact_count.numpy()[0])
+        test.assertGreaterEqual(soft_count, 1)
+
+        particle = int(contacts.soft_contact_particle.numpy()[0])
+        shape = int(contacts.soft_contact_shape.numpy()[0])
+        expected_shapes = {expected_local_shape_by_particle[particle], global_shape}
+        test.assertIn(shape, expected_shapes)
+
+
+add_function_test(
+    TestSoftContactWorldCandidates,
+    "test_soft_contact_generation_is_world_aware",
+    test_soft_contact_generation_is_world_aware,
+    devices=devices,
+)
+add_function_test(
+    TestSoftContactWorldCandidates,
+    "test_soft_contact_cap_warns_and_bounds_writes",
+    test_soft_contact_cap_warns_and_bounds_writes,
+    devices=devices,
+)
 
 
 def test_particle_shape_contacts(test, device, shape_type: GeoType):

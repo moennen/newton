@@ -13,6 +13,7 @@
 - Add `SensorTiledCamera.utils.assign_checkerboard_material(shape_indices=...)` for applying the checkerboard texture to selected shapes.
 - Add `--render-fps` to cap example rendering rate without changing simulation frame timing
 - Add `ModelBuilder.BvhConfig` for selecting Warp BVH constructors during model finalization for mesh, Gaussian, and shape BVHs.
+- Add `soft_contact_max` to `SolverVBD` so body-particle contact buffers can be sized consistently with `CollisionPipeline`.
 
 ### Changed
 
@@ -34,6 +35,7 @@
 ### Fixed
 
 - Fix `ViewerFile.is_running()` to return `False` after `ViewerFile.close()` so headless recording loops can terminate like interactive viewers. (#3094)
+- Fix particle-shape soft-contact allocation and generation for replicated worlds by using world-aware shape candidates instead of global all-pairs sizing.
 - Fix `SolverVBD` rigid contact injecting kinetic energy for yawed finite-radius contacts (e.g. small-radius cables blowing up). The normal response now acts at the geometric skeleton point rather than the rotating surface anchor, which was non-conservative under reorientation; friction still uses the surface anchor to preserve finite-radius slip. (#3125)
 - Fix `SolverKamino` contact filtering and constraint stabilization so gap/margin contacts are handled consistently, positive-distance contacts can be filtered as configured, and converted contact forces/wrenches populate matching Newton contact slots for `SensorContact`. (#2908)
 - Fix memory growth in the Style3D solver when CUDA Graph capture is disabled

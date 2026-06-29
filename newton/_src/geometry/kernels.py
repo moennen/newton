@@ -976,9 +976,11 @@ def counter_increment(counter: wp.array[int], counter_index: int, tids: wp.array
     """
     count = wp.atomic_add(counter, counter_index, 1)
     if count < index_limit or index_limit < 0:
-        tids[tid] = count
+        if tid < tids.shape[0]:
+            tids[tid] = count
         return count
-    tids[tid] = -1
+    if tid < tids.shape[0]:
+        tids[tid] = -1
     return -1
 
 
@@ -986,7 +988,9 @@ def counter_increment(counter: wp.array[int], counter_index: int, tids: wp.array
 def counter_increment_replay(
     counter: wp.array[int], counter_index: int, tids: wp.array[int], tid: int, index_limit: int
 ):
-    return tids[tid]
+    if tid < tids.shape[0]:
+        return tids[tid]
+    return -1
 
 
 @wp.kernel
@@ -1127,6 +1131,176 @@ def create_soft_contacts(
 
     if d < margin + s_margin + radius:
         index = counter_increment(soft_contact_count, 0, soft_contact_tids, tid)
+
+        if index < soft_contact_max:
+            # body_pos is the raw closest-surface point; per-shape margin is applied
+            # analytically at force eval. Inflation is just (SDF - margin), so n is
+            # unchanged and the closest point only slides out by margin along n
+            body_pos = wp.transform_point(X_bs, x_local - n * d)
+            body_vel = wp.transform_vector(X_bs, v)
+
+            world_normal = wp.transform_vector(X_ws, n)
+
+            soft_contact_shape[index] = shape_index
+            soft_contact_body_pos[index] = body_pos
+            soft_contact_body_vel[index] = body_vel
+            soft_contact_particle[index] = particle_index
+            soft_contact_normal[index] = world_normal
+
+
+@wp.kernel
+def create_soft_contacts_from_shape_candidates(
+    particle_q: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_world: wp.array[int],  # World indices for particles
+    body_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_source_ptr: wp.array[wp.uint64],
+    shape_world: wp.array[int],  # World indices for shapes
+    shape_candidate_indices: wp.array[wp.int32],
+    shape_candidate_counts: wp.array[wp.int32],
+    max_shape_candidates: int,
+    global_particle_candidate_row: int,
+    margin: float,
+    shape_margin: wp.array[float],
+    soft_contact_max: int,
+    shape_flags: wp.array[wp.int32],
+    shape_heightfield_index: wp.array[wp.int32],
+    heightfield_data: wp.array[HeightfieldData],
+    heightfield_elevations: wp.array[wp.float32],
+    # outputs
+    soft_contact_count: wp.array[int],
+    soft_contact_particle: wp.array[int],
+    soft_contact_shape: wp.array[int],
+    soft_contact_body_pos: wp.array[wp.vec3],
+    soft_contact_body_vel: wp.array[wp.vec3],
+    soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_tids: wp.array[int],
+):
+    particle_index, shape_slot = wp.tid()
+    if max_shape_candidates <= 0:
+        return
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    particle_world_id = particle_world[particle_index]
+    candidate_row = particle_world_id
+    if particle_world_id < 0:
+        candidate_row = global_particle_candidate_row
+    if candidate_row < 0 or candidate_row >= shape_candidate_counts.shape[0]:
+        return
+    if shape_slot >= shape_candidate_counts[candidate_row]:
+        return
+
+    shape_index = shape_candidate_indices[candidate_row * max_shape_candidates + shape_slot]
+    if shape_index < 0:
+        return
+    if (shape_flags[shape_index] & ShapeFlags.COLLIDE_PARTICLES) == 0:
+        return
+
+    # Keep the kernel robust if the candidate table was built externally.
+    shape_world_id = shape_world[shape_index]
+    if particle_world_id != -1 and shape_world_id != -1 and particle_world_id != shape_world_id:
+        return
+
+    rigid_index = shape_body[shape_index]
+
+    px = particle_q[particle_index]
+    radius = particle_radius[particle_index]
+
+    X_wb = wp.transform_identity()
+    if rigid_index >= 0:
+        X_wb = body_q[rigid_index]
+
+    X_bs = shape_transform[shape_index]
+
+    X_ws = wp.transform_multiply(X_wb, X_bs)
+    X_sw = wp.transform_inverse(X_ws)
+
+    # transform particle position to shape local space
+    x_local = wp.transform_point(X_sw, px)
+
+    # geo description
+    geo_type = shape_type[shape_index]
+    geo_scale = shape_scale[shape_index]
+    s_margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
+
+    # evaluate shape sdf
+    d = 1.0e6
+    n = wp.vec3()
+    v = wp.vec3()
+
+    if geo_type == GeoType.SPHERE:
+        d = sdf_sphere(x_local, geo_scale[0])
+        n = sdf_sphere_grad(x_local, geo_scale[0])
+
+    if geo_type == GeoType.BOX:
+        d = sdf_box(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+        n = sdf_box_grad(x_local, geo_scale[0], geo_scale[1], geo_scale[2])
+
+    if geo_type == GeoType.CAPSULE:
+        d = sdf_capsule(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_capsule_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.CYLINDER:
+        d = sdf_cylinder(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_cylinder_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.CONE:
+        d = sdf_cone(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+        n = sdf_cone_grad(x_local, geo_scale[0], geo_scale[1], int(Axis.Z))
+
+    if geo_type == GeoType.ELLIPSOID:
+        d = sdf_ellipsoid(x_local, geo_scale)
+        n = sdf_ellipsoid_grad(x_local, geo_scale)
+
+    if geo_type == GeoType.MESH or geo_type == GeoType.CONVEX_MESH:
+        mesh = shape_source_ptr[shape_index]
+
+        face_index = int(0)
+        face_u = float(0.0)
+        face_v = float(0.0)
+        sign = float(0.0)
+
+        # Use magnitude of components: the search radius must always be positive
+        # regardless of mirror parity.
+        min_scale = wp.min(wp.min(wp.abs(geo_scale[0]), wp.abs(geo_scale[1])), wp.abs(geo_scale[2]))
+        query = wp.mesh_query_point_sign_parity(
+            mesh, wp.cw_div(x_local, geo_scale), margin + s_margin / min_scale + radius / min_scale
+        )
+        if query.result:
+            sign = query.sign
+            face_index = query.face
+            face_u = query.u
+            face_v = query.v
+
+            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
+            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
+
+            shape_p = wp.cw_mul(shape_p, geo_scale)
+            shape_v = wp.cw_mul(shape_v, geo_scale)
+
+            delta = x_local - shape_p
+
+            d = wp.length(delta) * sign
+            n = wp.normalize(delta) * sign
+            v = shape_v
+
+    if geo_type == GeoType.PLANE:
+        d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
+        n = wp.vec3(0.0, 0.0, 1.0)
+
+    if geo_type == GeoType.HFIELD:
+        hfd = heightfield_data[shape_heightfield_index[shape_index]]
+        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
+
+    if d < margin + s_margin + radius:
+        candidate_tid = particle_index * max_shape_candidates + shape_slot
+        index = counter_increment(soft_contact_count, 0, soft_contact_tids, candidate_tid)
 
         if index < soft_contact_max:
             # body_pos is the raw closest-surface point; per-shape margin is applied
