@@ -1748,6 +1748,7 @@ class ViewerGL(ViewerBase):
             cache = {
                 "gaussian_cache_key": gaussian_cache_key,
                 "local_pos": positions,
+                "sample_indices": idx,
                 "vbo": vbo,
                 "colors": colors,
                 "colors_uploaded": False,
@@ -1757,6 +1758,19 @@ class ViewerGL(ViewerBase):
             self._gaussian_cache[name] = cache
 
         n = len(cache["local_pos"])
+
+        # Newton simulation updates Gaussian centers in the live Warp transform
+        # buffer.  The OpenGL viewer keeps a CPU-side instance buffer, so refresh
+        # the sampled centers before uploading it.  This is intentionally limited
+        # to the Newton GL backend; Kit uses the Fabric GPU path directly.
+        dynamic_positions = gaussian.warp_data is not None
+        if dynamic_positions:
+            live_transforms = gaussian.warp_data.transforms.numpy()
+            sample_indices = cache["sample_indices"]
+            if sample_indices is not None:
+                cache["local_pos"] = np.ascontiguousarray(live_transforms[sample_indices, :3], dtype=np.float32)
+            else:
+                cache["local_pos"] = np.ascontiguousarray(live_transforms[:, :3], dtype=np.float32)
 
         recreated = False
         if name not in self.objects:
@@ -1792,7 +1806,7 @@ class ViewerGL(ViewerBase):
                 float(xform.q[2]),
                 float(xform.q[3]),
             )
-        if not recreated and cache["last_xform"] == xform_key:
+        if not recreated and not dynamic_positions and cache["last_xform"] == xform_key:
             return
         cache["last_xform"] = xform_key
 

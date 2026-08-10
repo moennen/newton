@@ -1173,10 +1173,16 @@ class ViewerBase(ABC):
         layer_hidden = self._layer_force_hidden()
 
         for gname, gaussian, parent, shape_xform, world_idx, flags, is_static in self._gaussian_instances:
+            # Gaussian fields are an independent visual representation.  Once
+            # explicitly enabled, do not filter them through regular mesh shape
+            # visibility flags: USD Gaussian prims may legitimately carry no
+            # ShapeFlags.VISIBLE bit while still being renderable assets.
             visible = (
-                self._should_show_shape(flags, is_static) and self._should_render_world(world_idx) and not layer_hidden
+                self.show_gaussians
+                and self._should_render_world(world_idx)
+                and not layer_hidden
             )
-            if not visible or not self.show_gaussians:
+            if not visible:
                 self.log_gaussian(gname, gaussian, hidden=True)
                 continue
             if parent >= 0:
