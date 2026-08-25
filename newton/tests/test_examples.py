@@ -37,12 +37,12 @@ from newton.tests.unittest_utils import (
 )
 
 _HAS_ONNX_RUNTIME = importlib.util.find_spec("onnx") is not None and importlib.util.find_spec("warp_nn") is not None
-# Gaussian splat asset used by multiphysics.example_mujoco_vbd_gaussian_twin. It is not
-# redistributed with Newton, so tests that need it are skipped when it is missing. Keep
-# the default in sync with DEFAULT_ASSET in that example.
-_GAUSSIAN_TWIN_ASSET = os.environ.get(
-    "NEWTON_GAUSSIAN_TWIN_ASSET", "/mnt/data/isaac_lab_poc/ExportedToys/baked.BluehairRagdoll.usdz"
-)
+# The Gaussian twin example downloads its packaged asset from newton-assets by
+# default. ``NEWTON_GAUSSIAN_TWIN_ASSET`` remains available to override it in
+# local runs.
+# The Gaussian twin asset's tetrahedral mesh has a non-manifold surface, which Newton's
+# mesh preprocessing warns about once at load time.
+_NON_MANIFOLD_EDGE_OUTPUT_RE = r"[^\n]*UserWarning: Detected non-manifold edge\n[^\n]*\n?"
 _PXR_WORK_THREAD_LIMIT_OUTPUT_RE = (
     r"(?s)#+\n#  PXR_WORK_THREAD_LIMIT is overridden to '1'\.  Default is '0'\.  #\n#+\n?"
 )
@@ -1243,15 +1243,27 @@ add_example_test(
     TestMultiphysicsExamples,
     name="multiphysics.example_mujoco_vbd_gaussian_twin",
     devices=test_devices,
-    # Skipped unless the Gaussian splat asset is available on this machine.
     test_options={
         "num-frames": 2,
         "proxy-iterations": 1,
-        "cage-resolution": 8,
         "usd_required": True,
-        "asset_required": _GAUSSIAN_TWIN_ASSET,
     },
     use_viewer=True,
+    allow_output_regexes=[(_NON_MANIFOLD_EDGE_OUTPUT_RE, "stderr")],
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_vbd_gaussian_twin",
+    devices=test_devices,
+    test_options={
+        "num-frames": 2,
+        "proxy-iterations": 1,
+        "scene": "sway",
+        "usd_required": True,
+    },
+    use_viewer=True,
+    test_suffix="sway",
+    allow_output_regexes=[(_NON_MANIFOLD_EDGE_OUTPUT_RE, "stderr")],
 )
 add_example_test(
     TestMultiphysicsExamples,
