@@ -37,6 +37,12 @@ from newton.tests.unittest_utils import (
 )
 
 _HAS_ONNX_RUNTIME = importlib.util.find_spec("onnx") is not None and importlib.util.find_spec("warp_nn") is not None
+# Gaussian splat asset used by multiphysics.example_mujoco_vbd_gaussian_twin. It is not
+# redistributed with Newton, so tests that need it are skipped when it is missing. Keep
+# the default in sync with DEFAULT_ASSET in that example.
+_GAUSSIAN_TWIN_ASSET = os.environ.get(
+    "NEWTON_GAUSSIAN_TWIN_ASSET", "/mnt/data/isaac_lab_poc/ExportedToys/baked.BluehairRagdoll.usdz"
+)
 _PXR_WORK_THREAD_LIMIT_OUTPUT_RE = (
     r"(?s)#+\n#  PXR_WORK_THREAD_LIMIT is overridden to '1'\.  Default is '0'\.  #\n#+\n?"
 )
@@ -175,6 +181,11 @@ def add_example_test(
         usd_required = options.pop("usd_required", False)
         if usd_required and not USD_AVAILABLE:
             test.skipTest("Requires usd-core")
+
+        # Mark the test as skipped if an external asset is required but missing.
+        asset_required = options.pop("asset_required", None)
+        if asset_required is not None and not os.path.exists(asset_required):
+            test.skipTest(f"Requires asset {asset_required}")
 
         # Escalate deprecations to errors in the example subprocess only when the
         # runner was invoked with --strict-warnings (CI) and the example has not
@@ -1226,6 +1237,20 @@ add_example_test(
     name="multiphysics.example_mujoco_vbd_coupled_solver",
     devices=test_devices,
     test_options={"num-frames": 2, "proxy-iterations": 1},
+    use_viewer=True,
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_vbd_gaussian_twin",
+    devices=test_devices,
+    # Skipped unless the Gaussian splat asset is available on this machine.
+    test_options={
+        "num-frames": 2,
+        "proxy-iterations": 1,
+        "cage-resolution": 8,
+        "usd_required": True,
+        "asset_required": _GAUSSIAN_TWIN_ASSET,
+    },
     use_viewer=True,
 )
 add_example_test(
