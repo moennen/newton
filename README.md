@@ -751,7 +751,7 @@ If you run the examples from a source checkout with uv, use
       <code>python -m newton.examples mujoco_franka_vbd_cable_admm_solver</code>
     </td>
     <td align="center" width="33%">
-      <code>python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda</code>
+      <code>python -m newton.examples mujoco_vbd_gaussian_twin --asset "$NEWTON_GAUSSIAN_TWIN_ASSET" --fast-simulation</code>
     </td>
   </tr>
   <tr>

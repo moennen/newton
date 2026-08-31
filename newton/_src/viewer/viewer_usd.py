@@ -1109,6 +1109,12 @@ class ViewerUSD(ViewerBase):
             )
             prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
             prim.CreateAttribute("orientations", Sdf.ValueTypeNames.QuatfArray)
+            # ``ParticleField3DGaussianSplat`` may be unknown to a host USD
+            # schema registry (notably an Isaac Sim process that loaded its
+            # own USD distribution).  Create the inherited Imageable property
+            # explicitly, rather than creating a custom token attribute with
+            # the same name, so it retains standard USD visibility semantics.
+            UsdGeom.Imageable(prim).CreateVisibilityAttr()
             _usd_add_xform(prim)
             self._gaussians[name] = prim
 

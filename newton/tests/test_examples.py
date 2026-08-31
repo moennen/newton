@@ -1259,6 +1259,21 @@ add_example_test(
     test_options={
         "num-frames": 2,
         "proxy-iterations": 1,
+        "fast-simulation": True,
+        "usd_required": True,
+        "asset_required": _GAUSSIAN_TWIN_ASSET,
+    },
+    use_viewer=True,
+    test_suffix="fast_simulation",
+    allow_output_regexes=[(_NON_MANIFOLD_EDGE_OUTPUT_RE, "stderr")],
+)
+add_example_test(
+    TestMultiphysicsExamples,
+    name="multiphysics.example_mujoco_vbd_gaussian_twin",
+    devices=test_devices,
+    test_options={
+        "num-frames": 2,
+        "proxy-iterations": 1,
         "scene": "sway",
         "usd_required": True,
         "asset_required": _GAUSSIAN_TWIN_ASSET,

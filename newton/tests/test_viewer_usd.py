@@ -116,6 +116,7 @@ class TestViewerUSD(unittest.TestCase):
             atol=1.0e-6,
         )
         self.assertEqual(prim.GetAttribute("radiance:sphericalHarmonicsDegree").Get(), gaussian.sh_degree)
+        self.assertFalse(prim.GetAttribute("visibility").IsCustom())
         # A Gaussian is static unless its producer explicitly opts in to
         # streaming.  In particular, recording it must not mark all Gaussian
         # fields as animated in an RTX consumer.

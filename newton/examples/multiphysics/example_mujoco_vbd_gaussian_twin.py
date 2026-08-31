@@ -44,6 +44,7 @@
 # Command: python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda
 #          python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda --scene sway
 #          python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda --show-tetmesh
+#          python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda --fast-simulation
 #
 ###########################################################################
 
@@ -73,6 +74,19 @@ SKIN = "newton:deformableSkin"
 # Prims the physics import must not pick up: the visual surface is skinned for
 # rendering only and would otherwise be imported as a static shape.
 IGNORE_PATHS = [".*VisualMesh"]
+
+
+# This scene's default is deliberately conservative: it resolves the elastic
+# wave travel time of every tetrahedron and runs enough VBD iterations for the
+# gripper contact to be close to converged.  The real-time preset instead
+# targets a responsive visual demonstration.  Its four 4.17 ms substeps still
+# resolve the grasp, while 30 iterations are the lowest count that kept the
+# packaged Bluehair toy in the jaws throughout the lift.  Its lower drive
+# bandwidth avoids the finger/contact limit cycle that the 25 Hz default
+# exhibits with this coarser solve.
+FAST_SIMULATION_SUBSTEPS = 4
+FAST_SIMULATION_VBD_ITERATIONS = 30
+FAST_SIMULATION_DRIVE_FREQUENCY = 7.5
 
 
 def resolve_asset(path: str | None) -> str:
@@ -500,6 +514,15 @@ class GaussianTwin:
 class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
+        if args.fast_simulation:
+            # Keep the material and contact gains intact.  Reducing them makes
+            # the toy cheaper but also changes the demonstration into one
+            # where the jaws cannot reliably retain it.  This preset only
+            # reduces temporal resolution and nonlinear-solve convergence,
+            # then lowers the drive bandwidth to match that resolution.
+            args.substeps = FAST_SIMULATION_SUBSTEPS
+            args.vbd_iterations = FAST_SIMULATION_VBD_ITERATIONS
+            args.drive_frequency = FAST_SIMULATION_DRIVE_FREQUENCY
         self.args = args
         self.viewer = viewer
         self.scene = args.scene
@@ -979,6 +1002,16 @@ class Example:
             "small toy behave like a large one.",
         )
         parser.add_argument("--vbd-iterations", type=int, default=60, help="VBD iterations per substep.")
+        parser.add_argument(
+            "--fast-simulation",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Use the interactive Gaussian-twin preset (4 substeps x 30 VBD iterations, and a 7.5 Hz "
+            "gripper drive, per rendered frame). "
+            "It reduces the default solver work by roughly 10x and preserves the packaged toy's grasp/lift "
+            "demonstration, but is less accurate for stiff material waves and contact forces. This preset "
+            "intentionally overrides --substeps, --vbd-iterations, and --drive-frequency.",
+        )
         parser.add_argument("--density", type=float, default=300.0, help="Toy density [kg/m^3].")
         parser.add_argument(
             "--youngs-modulus",
