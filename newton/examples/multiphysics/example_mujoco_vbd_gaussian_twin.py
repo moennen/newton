@@ -23,10 +23,10 @@
 #     and --show-tetmesh already draws that surface from the live mesh.
 #
 # Nothing is voxelized or re-fitted at runtime: the example only reads the
-# authored binding. Gaussian centers follow the blended nodal displacements
-# and Gaussian orientations follow the rotation of the deformation gradient
-# blended with the same weights. The Gaussian field carries no mass and no
-# collision geometry; the tet mesh owns all physical state.
+# authored binding. Gaussian centers follow the blended nodal displacements;
+# optional orientations and scales follow the local deformation gradient. The
+# Gaussian field carries no mass and no collision geometry; the tet mesh owns
+# all physical state.
 #
 # Two scenes exercise rigid/soft coupling through ``SolverCoupledProxy``,
 # with the rigid bodies driven by MuJoCo and the toy by VBD:
@@ -36,13 +36,14 @@
 #   * ``sway``: the same grasp, then the carriage swings the toy back and
 #     forth so the skinned field lags and wobbles.
 #
-# Only the 'gl' and 'viser' viewers draw Gaussian assets; other backends
-# fall back to rendering the simulation mesh surface. Pass --show-tetmesh
-# to see that surface alongside the splats.
+# The RTX viewer ray traces the Gaussian assets, and the USD viewer records
+# them as native ``ParticleField3DGaussianSplat`` prims. Other backends fall
+# back to rendering the simulation mesh surface. Pass --show-tetmesh to see
+# that surface alongside the splats.
 #
-# Command: python -m newton.examples mujoco_vbd_gaussian_twin
-#          python -m newton.examples mujoco_vbd_gaussian_twin --scene sway
-#          python -m newton.examples mujoco_vbd_gaussian_twin --show-tetmesh
+# Command: python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda
+#          python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda --scene sway
+#          python -m newton.examples mujoco_vbd_gaussian_twin --asset path/to/package.usda --show-tetmesh
 #
 ###########################################################################
 
@@ -52,6 +53,7 @@ import argparse
 import math
 import os
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import warp as wp
@@ -60,13 +62,10 @@ from newton.solvers.experimental.coupled import SolverCoupledProxy
 import newton
 import newton.examples
 from newton.solvers import SolverMuJoCo, SolverVBD
-from newton.viewer import ViewerBase
+from newton.viewer import ViewerBase, ViewerViser
 
-# Folder and file of the packaged asset in the newton-assets repository. Set
-# ``--asset`` or the NEWTON_GAUSSIAN_TWIN_ASSET environment variable to use a
-# local package instead of the downloaded one.
-ASSET_FOLDER = "gaussian_splat_toys"
-ASSET_FILE = "baked.BluehairRagdoll_package.usda"
+# The packaged asset is not distributed with Newton. Set ``--asset`` or
+# ``NEWTON_GAUSSIAN_TWIN_ASSET`` to its USD package path.
 
 # Namespace of the skinning attributes authored on the asset.
 SKIN = "newton:deformableSkin"
@@ -77,12 +76,18 @@ IGNORE_PATHS = [".*VisualMesh"]
 
 
 def resolve_asset(path: str | None) -> str:
-    """Return the asset path to load, downloading the packaged asset if needed."""
-    return (
-        path
-        or os.environ.get("NEWTON_GAUSSIAN_TWIN_ASSET")
-        or str(newton.utils.download_asset(ASSET_FOLDER) / ASSET_FILE)
-    )
+    """Return the explicitly supplied Gaussian-twin asset path.
+
+    The asset contains a large third-party Gaussian capture and is therefore
+    intentionally not part of the Newton source or ``newton-assets`` package.
+    """
+    asset_path = path or os.environ.get("NEWTON_GAUSSIAN_TWIN_ASSET")
+    if not asset_path:
+        raise ValueError(
+            "This example requires a packaged Gaussian-twin USD asset. Pass "
+            "--asset PATH or set NEWTON_GAUSSIAN_TWIN_ASSET."
+        )
+    return asset_path
 
 
 @dataclass(frozen=True)
@@ -94,12 +99,23 @@ class SkinBinding:
         influence_weights: Blend weight of each influence, shape ``[num_gaussians, num_influences]``.
         points: Rest positions of the simulation mesh [m], shape ``[num_vertices, 3]``.
         tet_indices: Vertices of each tetrahedron, shape ``[num_tets, 4]``.
+        particle_radius: Contact radius authored with the mesh [m], or ``None`` when the
+            asset does not carry one. VBD collides a soft body as one sphere per vertex, so
+            this is what seals the boundary; a mesh whose vertex spacing is uniform can
+            state a radius that a rule of thumb based on edge length would get wrong.
     """
 
     influence_indices: np.ndarray
     influence_weights: np.ndarray
     points: np.ndarray
     tet_indices: np.ndarray
+    particle_radius: float | None = None
+
+
+def _optional_float(prim, name: str) -> float | None:
+    """Return an authored float attribute, or ``None`` when the asset omits it."""
+    attr = prim.GetAttribute(name)
+    return None if not attr or attr.Get() is None else float(attr.Get())
 
 
 def read_skin_binding(asset_path: str) -> SkinBinding:
@@ -139,6 +155,7 @@ def read_skin_binding(asset_path: str) -> SkinBinding:
         ),
         points=points,
         tet_indices=np.asarray(read(tet_prim, "tetVertexIndices"), dtype=np.int32).reshape(-1, 4),
+        particle_radius=_optional_float(tet_prim, "newton:simulationMesh:particleRadius"),
     )
     if len(binding.influence_indices) != count or len(binding.influence_weights) != count:
         raise ValueError(f"skinning binding does not match the authored pointCount of {count}")
@@ -147,7 +164,7 @@ def read_skin_binding(asset_path: str) -> SkinBinding:
     return binding
 
 
-def tet_rest_bases(binding: SkinBinding) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def tet_rest_bases(points: np.ndarray, tet_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Precompute the per-tetrahedron quantities the deformation gradient pass needs.
 
     Returns the inverse rest edge basis per tetrahedron [1/m], the rest volume
@@ -156,7 +173,7 @@ def tet_rest_bases(binding: SkinBinding) -> tuple[np.ndarray, np.ndarray, np.nda
     meshes contain a few slivers) get a zero basis and zero volume, so they drop
     out of the vertex average instead of polluting it.
     """
-    corners = binding.points[binding.tet_indices]
+    corners = points[tet_indices]
     edges = np.stack([corners[:, k] - corners[:, 0] for k in (1, 2, 3)], axis=-1)
     determinant = np.linalg.det(edges)
     usable = np.abs(determinant) > 1.0e-16
@@ -164,13 +181,91 @@ def tet_rest_bases(binding: SkinBinding) -> tuple[np.ndarray, np.ndarray, np.nda
     basis_inv[usable] = np.linalg.inv(edges[usable])
     volume = np.where(usable, np.abs(determinant) / 6.0, 0.0)
 
-    accumulated = np.zeros(len(binding.points))
-    np.add.at(accumulated, binding.tet_indices.ravel(), np.repeat(volume, 4))
+    accumulated = np.zeros(len(points))
+    np.add.at(accumulated, tet_indices.ravel(), np.repeat(volume, 4))
     inv_accumulated = np.where(accumulated > 0.0, 1.0 / np.maximum(accumulated, 1.0e-30), 0.0)
     return (
         basis_inv.astype(np.float32),
         volume.astype(np.float32),
         inv_accumulated.astype(np.float32),
+    )
+
+
+def fit_asset_to_simulation_transform(
+    asset_points: np.ndarray, simulation_points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit the asset-to-simulation affine transform from matching TetMesh vertices.
+
+    USD importers may apply the stage's axis and unit metadata before the
+    caller's placement transform.  The baked Gaussian binding, on the other
+    hand, is authored in the TetMesh's asset coordinates.  Deriving the
+    transform from the imported TetMesh keeps both representations in the same
+    space for any valid USD package instead of relying on a particular stage
+    convention.
+
+    Returns:
+        The row-vector linear transform, translation, and its closest proper
+        rotation (as a column-vector matrix).
+
+    Raises:
+        ValueError: If the importer changed vertex count, order, or geometry.
+    """
+    asset_points = np.asarray(asset_points, dtype=np.float64)
+    simulation_points = np.asarray(simulation_points, dtype=np.float64)
+    if asset_points.shape != simulation_points.shape or asset_points.ndim != 2 or asset_points.shape[1] != 3:
+        raise ValueError(
+            "The imported TetMesh does not have the same ordered vertices as the Gaussian skinning binding."
+        )
+
+    augmented = np.column_stack((asset_points, np.ones(len(asset_points))))
+    affine, _, rank, _ = np.linalg.lstsq(augmented, simulation_points, rcond=None)
+    if rank != 4:
+        raise ValueError("The TetMesh vertices cannot determine an asset-to-simulation transform.")
+    linear = affine[:3]
+    translation = affine[3]
+    reconstructed = asset_points @ linear + translation
+    scale = max(float(np.ptp(simulation_points, axis=0).max()), 1.0e-6)
+    max_error = float(np.max(np.abs(reconstructed - simulation_points)))
+    if max_error > 1.0e-4 * scale:
+        raise ValueError(
+            "The USD importer changed TetMesh geometry rather than applying a single stage/placement transform; "
+            "the authored Gaussian skinning binding cannot be used safely."
+        )
+
+    # ``linear`` maps row vectors.  Quaternion matrices map column vectors, so
+    # transpose before extracting the nearest rotation and discard any uniform
+    # stage scale from the orientation update.
+    u, _, vh = np.linalg.svd(linear.T)
+    rotation = u @ vh
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vh
+    return linear.astype(np.float32), translation.astype(np.float32), rotation.astype(np.float32)
+
+
+def measure_toy(points: np.ndarray) -> tuple[float, float, float, float, float, float, float]:
+    """Return rig dimensions and the waist/ground reference from simulation-space points."""
+    extent = np.ptp(points, axis=0)
+    length, width, thickness = (float(value) for value in extent)
+    middle_x = 0.5 * float(points[:, 0].min() + points[:, 0].max())
+    waist = np.abs(points[:, 0] - middle_x) < 0.15 * length
+    waist_y = points[waist, 1]
+    waist_center_y = 0.5 * float(waist_y.min() + waist_y.max())
+    waist_half_width = 0.5 * float(waist_y.max() - waist_y.min())
+    ground_z = float(points[:, 2].min())
+    return length, width, thickness, middle_x, waist_center_y, ground_z, waist_half_width
+
+
+def mean_tet_edge_length(points: np.ndarray, tet_indices: np.ndarray) -> float:
+    """Return the mean edge length of a tetrahedral mesh in its current units."""
+    corners = points[tet_indices]
+    return float(
+        np.mean(
+            [
+                np.linalg.norm(corners[:, a] - corners[:, b], axis=1)
+                for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+            ]
+        )
     )
 
 
@@ -211,15 +306,20 @@ def skin_gaussians_to_mesh(
     influence_weights: wp.array2d[float],
     rest_position: wp.array[wp.vec3],
     rest_rotation: wp.array[wp.quat],
+    rest_scale: wp.array[wp.vec3],
+    deform_scales: int,
     transforms_out: wp.array[wp.transform],
+    scales_out: wp.array[wp.vec3],
 ):
-    """Update Gaussian splat centers/rotations from the live VBD simulation mesh.
+    """Update Gaussian splat centers, rotations, and optional radii from VBD.
 
     Centers follow the weighted blend of the nodal displacements of the bound
     vertices, which reproduces the authored center exactly at rest even where
     the baked weights extrapolate outside the mesh. Orientations follow the
     rotation part of the deformation gradient blended with the same weights,
-    which stays smooth across element boundaries.
+    which stays smooth across element boundaries. When requested, the three
+    radii use the lengths of that gradient's material-axis images; Gaussian
+    covariance cannot represent the remaining shear exactly.
     """
     i = wp.tid()
     center = rest_position[i]
@@ -231,15 +331,15 @@ def skin_gaussians_to_mesh(
         gradient += vertex_gradient[v] * (w * vertex_inv_volume[v])
 
     # Rotation part of the blended gradient, extracted by Gram-Schmidt
-    # orthonormalization of its columns. Stretch is intentionally dropped: only
-    # Gaussian centers and orientations are skinned, covariance stays at its
-    # bind-pose value.
+    # orthonormalization of its columns.
     c0 = wp.vec3(gradient[0, 0], gradient[1, 0], gradient[2, 0])
     c1 = wp.vec3(gradient[0, 1], gradient[1, 1], gradient[2, 1])
     if wp.length(c0) < 1.0e-9 or wp.length(wp.cross(c0, c1)) < 1.0e-12:
         # Vertices without a usable gradient (no incident tetrahedron, or a
         # collapsed neighborhood) keep the bind-pose orientation.
         transforms_out[i] = wp.transform(center, rest_rotation[i])
+        if deform_scales != 0:
+            scales_out[i] = rest_scale[i]
         return
 
     c0 = wp.normalize(c0)
@@ -248,6 +348,36 @@ def skin_gaussians_to_mesh(
 
     q_rot = wp.quat_from_matrix(wp.matrix_from_cols(c0, c1, c2))
     transforms_out[i] = wp.transform(center, wp.normalize(q_rot * rest_rotation[i]))
+    if deform_scales != 0:
+        # Gaussian covariance supports rotation and three principal radii, but
+        # not shear.  The lengths of F's material-axis images retain its local
+        # axial stretches while the orientation above carries its rotation.
+        stretch = wp.vec3(
+            wp.length(wp.vec3(gradient[0, 0], gradient[1, 0], gradient[2, 0])),
+            wp.length(wp.vec3(gradient[0, 1], gradient[1, 1], gradient[2, 1])),
+            wp.length(wp.vec3(gradient[0, 2], gradient[1, 2], gradient[2, 2])),
+        )
+        scale = rest_scale[i]
+        scales_out[i] = wp.vec3(scale[0] * stretch[0], scale[1] * stretch[1], scale[2] * stretch[2])
+
+
+@wp.kernel
+def skin_gaussian_positions_to_mesh(
+    particle_q: wp.array[wp.vec3],
+    rest_particle_q: wp.array[wp.vec3],
+    influence_indices: wp.array2d[wp.int32],
+    influence_weights: wp.array2d[float],
+    rest_position: wp.array[wp.vec3],
+    rest_rotation: wp.array[wp.quat],
+    transforms_out: wp.array[wp.transform],
+):
+    """Update Gaussian centers without evaluating deformation gradients."""
+    i = wp.tid()
+    center = rest_position[i]
+    for k in range(influence_indices.shape[1]):
+        v = influence_indices[i, k]
+        center += (particle_q[v] - rest_particle_q[v]) * influence_weights[i, k]
+    transforms_out[i] = wp.transform(center, rest_rotation[i])
 
 
 def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -273,26 +403,48 @@ def set_joint_target(joint_target_q: wp.array[float], index: int, value: float):
 class GaussianTwin:
     """Render-only Gaussian field skinned to a simulated tetrahedral mesh."""
 
+    _MODE_ATTRIBUTES: ClassVar = {
+        "position": ("positions",),
+        "position-rotation": ("positions", "orientations"),
+        "position-rotation-scale": ("positions", "orientations", "scales"),
+    }
+
     def __init__(
         self,
         binding: SkinBinding,
         gaussian: newton.Gaussian,
-        xform: wp.transform,
+        asset_linear: np.ndarray,
+        asset_translation: np.ndarray,
+        asset_rotation: np.ndarray,
         rest_particle_q: wp.array,
+        deformation: str,
     ):
         device = rest_particle_q.device
         self.transforms = gaussian.warp_data.transforms
+        self.scales = gaussian.warp_data.scales
         self.rest_particle_q = rest_particle_q
+        self.deformation = deformation
+        self.dynamic_attributes = self._MODE_ATTRIBUTES[deformation]
+        # This is a private viewer hint: a general Gaussian asset does not know
+        # which of its arrays an example changes.  It lets RTX stream exactly
+        # the selected attributes instead of treating unchanged arrays as dirty.
+        gaussian._newton_dynamic_attributes = self.dynamic_attributes
 
-        # The importer put the asset's placement on the Gaussian shape transform;
-        # the example zeroes it and folds it into the bind pose instead, so the
-        # kernel can write world-space transforms directly.
+        # Fold the USD stage conversion and placement into the bind pose before
+        # zeroing the shape transform.  This is inferred from the imported
+        # TetMesh because USD axis/unit metadata is applied by the importer but
+        # not to the custom skinning attributes.
         rest = self.transforms.numpy()
-        rotation = np.array(wp.quat_to_matrix(xform.q), dtype=np.float32).reshape(3, 3)
-        rest_position = rest[:, 0:3] @ rotation.T + np.array(xform.p, dtype=np.float32)
-        rest_rotation = quat_mul(np.array(xform.q, dtype=np.float32), rest[:, 3:7])
+        rotation_quat = np.array(wp.quat_from_matrix(wp.mat33(*asset_rotation.reshape(-1).tolist())), dtype=np.float32)
+        rest_position = rest[:, 0:3] @ asset_linear + asset_translation
+        rest_rotation = quat_mul(rotation_quat, rest[:, 3:7])
 
-        basis_inv, tet_volume, vertex_inv_volume = tet_rest_bases(binding)
+        # The physics importer has already applied the asset's stage transform
+        # and the example placement to ``rest_particle_q``. Measure the rest
+        # bases in that same frame so the deformation gradient is identity at
+        # bind pose; using the authored, untransformed basis would apply the
+        # stage rotation a second time to every Gaussian orientation.
+        basis_inv, tet_volume, vertex_inv_volume = tet_rest_bases(rest_particle_q.numpy(), binding.tet_indices)
         self.gradient_inputs = [
             wp.array(binding.tet_indices, dtype=wp.int32, device=device),
             wp.array(basis_inv, dtype=wp.mat33, device=device),
@@ -306,11 +458,22 @@ class GaussianTwin:
             wp.array(binding.influence_weights, dtype=float, device=device),
             wp.array(rest_position, dtype=wp.vec3, device=device),
             wp.array(rest_rotation, dtype=wp.quat, device=device),
+            wp.clone(self.scales),
         ]
 
     def update(self, state: newton.State) -> None:
         """Skin the Gaussian field to the current particle positions."""
         device = self.transforms.device
+        if self.deformation == "position":
+            wp.launch(
+                skin_gaussian_positions_to_mesh,
+                dim=len(self.transforms),
+                inputs=[state.particle_q, self.rest_particle_q, *self.skin_inputs[1:5]],
+                outputs=[self.transforms],
+                device=device,
+            )
+            return
+
         self.vertex_gradient.zero_()
         wp.launch(
             accumulate_vertex_gradients,
@@ -322,8 +485,14 @@ class GaussianTwin:
         wp.launch(
             skin_gaussians_to_mesh,
             dim=len(self.transforms),
-            inputs=[state.particle_q, self.rest_particle_q, self.vertex_gradient, *self.skin_inputs],
-            outputs=[self.transforms],
+            inputs=[
+                state.particle_q,
+                self.rest_particle_q,
+                self.vertex_gradient,
+                *self.skin_inputs,
+                int(self.deformation == "position-rotation-scale"),
+            ],
+            outputs=[self.transforms, self.scales],
             device=device,
         )
 
@@ -337,39 +506,50 @@ class Example:
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = args.substeps
-        self.sim_dt = self.frame_dt / self.sim_substeps
-
         self.asset = resolve_asset(args.asset)
         binding = read_skin_binding(self.asset)
-        # Lay the toy on its back on the ground plane: a plush ragdoll standing on two thin
-        # legs topples within a tenth of a second, long before jaws driven at a frequency the
-        # substeps can resolve would reach it, so the scene picks it up off the ground. The
-        # rotation turns the asset's long axis onto +x, its width onto the closing direction
-        # +y and its thickness onto +z, and the offset centers the toy over the origin.
-        lay_down = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 1.0, 1.0)), 2.0 * math.pi / 3.0)
-        rest = binding.points @ np.array(wp.quat_to_matrix(lay_down), dtype=np.float32).reshape(3, 3).T
+        # Turn the toy into the pose the jaws can actually pinch. A capture arrives in
+        # whatever frame the scan had and a packaged toy is authored lying flat, while this
+        # rig is built along fixed axes, so the pose is derived from the toy's own extents:
+        # the longest onto +x, so the jaws close across the body rather than along it, the
+        # *shortest* onto the closing direction +y, and what is left onto +z. The offset
+        # then centers the toy over the origin.
+        #
+        # Pinching the shortest cross-section lets the jaws indent the toy
+        # enough to retain it without requiring an excessive drive force.
+        longest, middle, shortest = np.argsort(np.ptp(binding.points, axis=0))[::-1]
+        basis = np.eye(3)[[longest, shortest, middle]]
+        if np.linalg.det(basis) < 0.0:
+            # An odd permutation mirrors the toy, so flip the closing axis to get a rotation
+            # back. The jaws straddle the waist symmetrically and cannot tell the difference.
+            basis[1] = -basis[1]
+        lay_down = wp.quat_from_matrix(wp.mat33(*basis.flatten().tolist()))
+        rest = binding.points @ basis.T.astype(np.float32)
 
         # Packaged toys differ in size and shape, so the rig and the motion schedule are sized
         # from the toy's own dimensions and from the waist, the cross-section the jaws close
         # on. The waist is what gets centered over the origin rather than the whole bounding
         # box: a captured toy is not symmetric, and centering the box leaves the waist off to
         # one side, where one jaw squeezes while the other closes on air.
-        self.toy_length, self.toy_width, self.toy_thickness = (float(extent) for extent in np.ptp(rest, axis=0))
-        middle = 0.5 * float(rest[:, 0].min() + rest[:, 0].max())
-        waist = np.abs(rest[:, 0] - middle) < 0.15 * self.toy_length
-        waist_y = rest[waist, 1]
-        self.waist_half_width = 0.5 * float(waist_y.max() - waist_y.min())
-        offset = np.array(
-            [-middle, -0.5 * float(waist_y.min() + waist_y.max()), -float(rest[:, 2].min())], dtype=np.float32
-        )
+        (
+            self.toy_length,
+            self.toy_width,
+            self.toy_thickness,
+            middle_x,
+            waist_center_y,
+            ground_z,
+            self.waist_half_width,
+        ) = measure_toy(rest)
+        offset = np.array([-middle_x, -waist_center_y, -ground_z], dtype=np.float32)
         toy_xform = wp.transform(wp.vec3(*offset.tolist()), lay_down)
-        rest = rest + offset
-        corners = binding.points[binding.tet_indices]
-        edge_length = float(
-            np.mean([np.linalg.norm(corners[:, a] - corners[:, b], axis=1) for a, b in ((0, 1), (0, 2), (0, 3))])
-        )
-        self.particle_radius = args.particle_radius if args.particle_radius > 0.0 else 0.4 * edge_length
+        edge_length = mean_tet_edge_length(binding.points, binding.tet_indices)
+        # A radius authored with the mesh wins: the packaging step measures the boundary
+        # vertex spacing and states a radius that makes neighbouring spheres overlap, which
+        # a fraction of the mean edge length only approximates.
+        if args.particle_radius > 0.0:
+            self.particle_radius = args.particle_radius
+        else:
+            self.particle_radius = binding.particle_radius or 0.4 * edge_length
 
         builder = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(builder)
@@ -377,32 +557,77 @@ class Example:
 
         # The asset authors no physics material, so the toy's material comes from the
         # builder defaults that the TetMesh import picks up.
+        #
+        # Express the default modulus as E/(rho*g*L), so differently sized
+        # packaged toys sag by a comparable fraction of their length.
+        self.youngs_modulus = args.youngs_modulus or (args.gravity_stiffness * args.density * 9.81 * self.toy_length)
+        # A substep has to be short enough to resolve the fastest (longitudinal)
+        # elastic wave crossing one tetrahedron, dt <= h / sqrt((lambda + 2*mu)/rho).
+        # Derive the count from this transit time rather than assuming a
+        # particular asset size or mesh resolution.
         poisson = args.poissons_ratio
         builder.default_tet_density = args.density
-        builder.default_tet_k_mu = args.youngs_modulus / (2.0 * (1.0 + poisson))
-        builder.default_tet_k_lambda = args.youngs_modulus * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
+        builder.default_tet_k_mu = self.youngs_modulus / (2.0 * (1.0 + poisson))
+        builder.default_tet_k_lambda = self.youngs_modulus * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
+        wave_speed = math.sqrt((builder.default_tet_k_lambda + 2.0 * builder.default_tet_k_mu) / args.density)
+        self.sim_substeps = args.substeps or max(1, math.ceil(self.frame_dt * wave_speed / edge_length))
+        self.sim_dt = self.frame_dt / self.sim_substeps
         # Viscous damping is a stress per unit strain rate, so the rate it imposes on an
         # element grows as the elements get smaller. Fixing the damping ratio against the
         # element's own elastic response instead keeps the toy equally damped at any mesh
         # resolution and toy size, where a fixed [Pa*s] value would diverge on fine meshes.
         builder.default_tet_k_damp = (
-            2.0 * args.damping_ratio * edge_length * math.sqrt(args.youngs_modulus * args.density)
+            2.0 * args.damping_ratio * edge_length * math.sqrt(self.youngs_modulus * args.density)
         )
         builder.default_particle_radius = self.particle_radius
 
+        toy_particle_start = builder.particle_count
+        toy_tet_start = len(builder.tet_materials)
         results = builder.add_usd(self.asset, xform=toy_xform, ignore_paths=IGNORE_PATHS)
-        self.toy_particles = list(range(builder.particle_count))
-        # The baked binding indexes the authored mesh, so it only describes the imported
-        # body if the import did not move the vertices around. A stage that declares no
-        # up axis, for instance, is taken as Y-up and comes in rotated, which would place
-        # the toy on its side and skin every Gaussian to the wrong part of it.
-        imported = np.asarray(builder.particle_q, dtype=np.float32)
-        if imported.shape != rest.shape or not np.allclose(imported, rest, atol=1.0e-5):
-            raise ValueError(
-                f"'{self.asset}' imported {len(imported)} simulation mesh vertices that do not match the "
-                f"{len(rest)} vertices its skinning binding refers to; check that the stage declares "
-                "'upAxis = Z' and 'metersPerUnit = 1'"
+        self.toy_particles = list(range(toy_particle_start, builder.particle_count))
+        # The baked binding indexes the authored mesh.  USD import applies stage
+        # axis/unit metadata and the requested placement to the physics mesh,
+        # so infer that common transform from the ordered TetMesh vertices and
+        # use it for the Gaussian bind pose below.
+        imported = np.asarray(builder.particle_q[toy_particle_start:], dtype=np.float32)
+        asset_linear, asset_translation, asset_rotation = fit_asset_to_simulation_transform(binding.points, imported)
+        # All dimensions used by the rig and the material are physical, so
+        # recompute them after the USD importer has applied stage units/axes
+        # and the requested placement. The initial asset-space estimate above
+        # exists only to construct that placement transform.
+        (
+            self.toy_length,
+            self.toy_width,
+            self.toy_thickness,
+            self.toy_center_x,
+            self.toy_center_y,
+            self.toy_ground_z,
+            self.waist_half_width,
+        ) = measure_toy(imported)
+        edge_length = mean_tet_edge_length(imported, binding.tet_indices)
+        if args.particle_radius <= 0.0:
+            if binding.particle_radius is not None:
+                self.particle_radius = binding.particle_radius * float(np.cbrt(abs(np.linalg.det(asset_linear))))
+            else:
+                self.particle_radius = 0.4 * edge_length
+            for particle in self.toy_particles:
+                builder.particle_radius[particle] = self.particle_radius
+
+        self.youngs_modulus = args.youngs_modulus or (args.gravity_stiffness * args.density * 9.81 * self.toy_length)
+        builder.default_tet_k_mu = self.youngs_modulus / (2.0 * (1.0 + poisson))
+        builder.default_tet_k_lambda = self.youngs_modulus * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson))
+        builder.default_tet_k_damp = (
+            2.0 * args.damping_ratio * edge_length * math.sqrt(self.youngs_modulus * args.density)
+        )
+        for tet in range(toy_tet_start, len(builder.tet_materials)):
+            builder.tet_materials[tet] = (
+                builder.default_tet_k_mu,
+                builder.default_tet_k_lambda,
+                builder.default_tet_k_damp,
             )
+        wave_speed = math.sqrt((builder.default_tet_k_lambda + 2.0 * builder.default_tet_k_mu) / args.density)
+        self.sim_substeps = args.substeps or max(1, math.ceil(self.frame_dt * wave_speed / edge_length))
+        self.sim_dt = self.frame_dt / self.sim_substeps
         gaussian_shape = next(
             shape
             for shape in results["path_shape_map"].values()
@@ -422,7 +647,7 @@ class Example:
         # contact frequency orders of magnitude above the substep rate, which throws the
         # particles off on the very first substep. Deriving the gain from the mean particle
         # mass and a contact frequency keeps the response resolvable at any toy scale.
-        particle_mass = float(np.mean(1.0 / self.model.particle_inv_mass.numpy()))
+        particle_mass = float(np.mean(self.model.particle_mass.numpy()[self.toy_particles]))
         contact_omega = 2.0 * math.pi * args.contact_frequency
         self.model.soft_contact_ke = particle_mass * contact_omega * contact_omega
         self.model.soft_contact_kd = 1.0e-4
@@ -437,7 +662,10 @@ class Example:
             "rigid_compliant_alm": True,
             "friction_epsilon": 0.01,
             "particle_enable_self_contact": False,
-            "rigid_body_particle_contact_buffer_size": 2048,
+            # A jaw closing on the toy can touch every one of its particles at once, so the
+            # per-body soft-contact list has to be as long as the toy, not a fixed guess
+            # that a finer simulation mesh silently overflows.
+            "rigid_body_particle_contact_buffer_size": max(256, len(self.toy_particles)),
         }
         self.solver = SolverCoupledProxy(
             model=self.model,
@@ -485,8 +713,11 @@ class Example:
         self.twin = GaussianTwin(
             binding,
             self.model.shape_source[gaussian_shape],
-            toy_xform,
+            asset_linear,
+            asset_translation,
+            asset_rotation,
             wp.clone(self.state_0.particle_q),
+            args.splat_deformation,
         )
         self.twin.update(self.state_0)
         self.initial_tet_center = np.mean(self.state_0.particle_q.numpy(), axis=0)
@@ -502,11 +733,16 @@ class Example:
         # Only some backends draw Gaussian assets; ``log_gaussian`` is a no-op in the
         # base viewer. Without it the toy would be invisible, so fall back to the
         # simulation mesh surface and say why.
-        splats_supported = type(self.viewer).log_gaussian is not ViewerBase.log_gaussian
+        # Viser's Gaussian API currently caches its immutable asset positions,
+        # so it cannot visualize this field's per-frame skinning correctly.
+        # Use the live tetmesh fallback there rather than showing a static twin.
+        splats_supported = type(self.viewer).log_gaussian is not ViewerBase.log_gaussian and not isinstance(
+            self.viewer, ViewerViser
+        )
         if not splats_supported and not args.quiet:
             print(
                 f"{type(self.viewer).__name__} cannot render Gaussian splats; showing the simulation "
-                "mesh instead. Run with '--viewer gl' or '--viewer viser' to see the Gaussian twin."
+                "mesh instead. Run with '--viewer gl' or '--viewer rtx' to see the Gaussian twin."
             )
         if hasattr(self.viewer, "show_gaussians"):
             # The visible appearance is meant to come from the splats alone, so the tet
@@ -533,25 +769,34 @@ class Example:
         cfg = newton.ModelBuilder.ShapeConfig(density=800.0, ke=8.0e4, kd=1.0e-4, kf=1.0e3, mu=1.0)
         length = self.toy_length
         # The jaws straddle the waist, clear of it when open and squeezing into it when
-        # closed, so both the gap and the travel come from the waist's own half width.
-        grip_z = self.args.grip_height * self.toy_thickness
+        # closed, so both gaps come from the waist's own half width. The
+        # closing target is a real gap, not a travel distance from the open gap.
+        grip_z = self.toy_ground_z + self.args.grip_height * self.toy_thickness
         open_y = self.args.finger_open * self.waist_half_width
-        self.finger_close = (self.args.finger_open - self.args.pinch_depth) * self.waist_half_width
-        back_x = -0.7 * length
+        self.finger_close = self.args.pinch_depth * self.waist_half_width
+        back_x = self.toy_center_x - 0.7 * length
         hub = 0.06 * length
         finger_color = wp.vec3(0.88, 0.48, 0.22)
 
-        carriage_xform = wp.transform(wp.vec3(back_x - 1.5 * hub, 0.0, grip_z), wp.quat_identity())
+        carriage_xform = wp.transform(wp.vec3(back_x - 1.5 * hub, self.toy_center_y, grip_z), wp.quat_identity())
         carriage = builder.add_link(xform=carriage_xform, label="carriage")
         builder.add_shape_box(carriage, hx=hub, hy=hub, hz=hub, cfg=cfg, color=wp.vec3(0.3, 0.32, 0.36))
-        palm = builder.add_link(xform=wp.transform(wp.vec3(back_x, 0.0, grip_z), wp.quat_identity()), label="palm")
+        palm = builder.add_link(
+            xform=wp.transform(wp.vec3(back_x, self.toy_center_y, grip_z), wp.quat_identity()), label="palm"
+        )
         builder.add_shape_box(palm, hx=hub, hy=open_y, hz=hub, cfg=cfg, color=wp.vec3(0.22, 0.28, 0.34))
         finger_hx = 0.18 * length
         finger_hy = 0.02 * length
         finger_hz = 0.5 * self.toy_thickness
-        left = builder.add_link(xform=wp.transform(wp.vec3(0.0, open_y, grip_z), wp.quat_identity()), label="left")
+        left = builder.add_link(
+            xform=wp.transform(wp.vec3(self.toy_center_x, self.toy_center_y + open_y, grip_z), wp.quat_identity()),
+            label="left",
+        )
         builder.add_shape_box(left, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=cfg, color=finger_color)
-        right = builder.add_link(xform=wp.transform(wp.vec3(0.0, -open_y, grip_z), wp.quat_identity()), label="right")
+        right = builder.add_link(
+            xform=wp.transform(wp.vec3(self.toy_center_x, self.toy_center_y - open_y, grip_z), wp.quat_identity()),
+            label="right",
+        )
         builder.add_shape_box(right, hx=finger_hx, hy=finger_hy, hz=finger_hz, cfg=cfg, color=finger_color)
 
         # Critically damped position drives at args.drive_frequency for the mass the rig
@@ -639,10 +884,10 @@ class Example:
         self.graph = capture.graph
 
     def simulate(self):
-        self.collision_pipeline.collide(self.state_0, self.contacts)
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             newton.examples.apply_coupled_viewer_forces(self, self.state_0)
+            self.collision_pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -654,8 +899,12 @@ class Example:
         else:
             self.simulate()
         self.twin.update(self.state_0)
-        swing = abs(float(np.mean(self.state_0.particle_q.numpy()[:, 0])) - self.initial_tet_center[0])
-        self.max_toy_swing = max(self.max_toy_swing, swing)
+        # This validation is only needed by the test harness.  ``numpy()`` is a
+        # device-wide synchronization and copying all particles every interactive
+        # frame prevents simulation and rendering from overlapping.
+        if self.args.test:
+            swing = abs(float(np.mean(self.state_0.particle_q.numpy()[:, 0])) - self.initial_tet_center[0])
+            self.max_toy_swing = max(self.max_toy_swing, swing)
         self.sim_time += self.frame_dt
 
     def render(self):
@@ -677,6 +926,13 @@ class Example:
         assert particle_q[:, 2].max() < 8.0 * length, "Simulation mesh exploded upward"
 
         tet_shift = np.mean(particle_q, axis=0) - self.initial_tet_center
+        # A toy the jaws are holding stays with them, so the travel is bounded on both
+        # sides. Only asking for a lower bound let a run through in which the toy was
+        # flung 6 metres, a swing of 175 times the amplitude the carriage was driven at.
+        reach = (self.args.sway_distance if self.scene == "sway" else 0.0) + 1.0
+        assert self.max_toy_swing < reach * length, (
+            f"Toy was thrown rather than carried: max dx={self.max_toy_swing:.4f}"
+        )
         # Short runs (the CI smoke test uses two frames) stop before the gripper has
         # moved, so only check the outcome once the motion schedule has played out.
         lift_done = self.args.close_time + self.args.lift_time
@@ -712,12 +968,31 @@ class Example:
             type=str,
             default=None,
             help="USD package holding the Gaussian field, its TetMesh, and the baked skinning binding. "
-            f"Defaults to '{ASSET_FILE}' downloaded from newton-assets.",
+            "Required unless NEWTON_GAUSSIAN_TWIN_ASSET is set.",
         )
-        parser.add_argument("--substeps", type=int, default=32, help="Simulation substeps per rendered frame.")
+        parser.add_argument(
+            "--substeps",
+            type=int,
+            default=0,
+            help="Simulation substeps per rendered frame. Defaults to the count that keeps a substep "
+            "inside the time an elastic wave takes to cross one tetrahedron, which is what makes a "
+            "small toy behave like a large one.",
+        )
         parser.add_argument("--vbd-iterations", type=int, default=60, help="VBD iterations per substep.")
         parser.add_argument("--density", type=float, default=300.0, help="Toy density [kg/m^3].")
-        parser.add_argument("--youngs-modulus", type=float, default=3.5e4, help="Toy Young's modulus [Pa].")
+        parser.add_argument(
+            "--youngs-modulus",
+            type=float,
+            default=0.0,
+            help="Toy Young's modulus [Pa]. Defaults to whatever --gravity-stiffness implies for the toy's own size.",
+        )
+        parser.add_argument(
+            "--gravity-stiffness",
+            type=float,
+            default=125.0,
+            help="Toy stiffness as a multiple of its own weight per unit area, E/(rho*g*L). Dimensionless, "
+            "so the toy sags the same fraction of its length at any authored size.",
+        )
         parser.add_argument("--poissons-ratio", type=float, default=0.35, help="Toy Poisson's ratio.")
         parser.add_argument(
             "--damping-ratio",
@@ -765,7 +1040,7 @@ class Example:
         parser.add_argument(
             "--pinch-depth",
             type=float,
-            default=0.7,
+            default=0.9,
             help="Half gap between the closed jaws [half widths of the toy's waist]. Below 1.0 the jaws "
             "squeeze into the toy, which is what friction needs to hold it.",
         )
@@ -794,6 +1069,14 @@ class Example:
             action=argparse.BooleanOptionalAction,
             default=False,
             help="Show the VBD simulation mesh surface (default: off so only the Gaussian twin is visible).",
+        )
+        parser.add_argument(
+            "--splat-deformation",
+            choices=GaussianTwin._MODE_ATTRIBUTES,
+            default="position-rotation-scale",
+            help="Gaussian attributes deformed from the tet mesh: centers only, centers plus orientation, or "
+            "centers plus orientation and per-axis scale. Scale deformation approximates stretch but cannot "
+            "represent shear.",
         )
         return parser
 

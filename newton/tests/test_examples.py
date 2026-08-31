@@ -37,9 +37,9 @@ from newton.tests.unittest_utils import (
 )
 
 _HAS_ONNX_RUNTIME = importlib.util.find_spec("onnx") is not None and importlib.util.find_spec("warp_nn") is not None
-# The Gaussian twin example downloads its packaged asset from newton-assets by
-# default. ``NEWTON_GAUSSIAN_TWIN_ASSET`` remains available to override it in
-# local runs.
+# The Gaussian twin asset is a third-party capture and is not redistributed
+# with Newton. Tests run only where the package path is explicitly provided.
+_GAUSSIAN_TWIN_ASSET = os.environ.get("NEWTON_GAUSSIAN_TWIN_ASSET", "")
 # The Gaussian twin asset's tetrahedral mesh has a non-manifold surface, which Newton's
 # mesh preprocessing warns about once at load time.
 _NON_MANIFOLD_EDGE_OUTPUT_RE = r"[^\n]*UserWarning: Detected non-manifold edge\n[^\n]*\n?"
@@ -1247,6 +1247,7 @@ add_example_test(
         "num-frames": 2,
         "proxy-iterations": 1,
         "usd_required": True,
+        "asset_required": _GAUSSIAN_TWIN_ASSET,
     },
     use_viewer=True,
     allow_output_regexes=[(_NON_MANIFOLD_EDGE_OUTPUT_RE, "stderr")],
@@ -1260,6 +1261,7 @@ add_example_test(
         "proxy-iterations": 1,
         "scene": "sway",
         "usd_required": True,
+        "asset_required": _GAUSSIAN_TWIN_ASSET,
     },
     use_viewer=True,
     test_suffix="sway",

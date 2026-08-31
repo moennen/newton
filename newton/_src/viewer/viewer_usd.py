@@ -68,6 +68,38 @@ def _usd_set_xform(
         xform_ops[2].Set(Gf.Vec3d(float(scale[0]), float(scale[1]), float(scale[2])), time)
 
 
+def _gaussian_frame_data(gaussian: newton.Gaussian) -> tuple[np.ndarray, np.ndarray]:
+    """Return the current splat centers ``(N, 3)`` and orientations ``(N, 4)``.
+
+    ``Gaussian.warp_data.transforms`` is the array a solver skins every step, so it
+    is the live source once the asset has been finalized. The immutable numpy
+    arrays on the asset are the fallback before that happens. Warp packs a
+    transform as ``(x, y, z, qx, qy, qz, qw)``, which matches the in-memory layout
+    of a USD ``quatf`` (imaginary part first), so no reordering is needed.
+
+    The USD backend authors time samples through the USD Python API, so it needs
+    host NumPy arrays.  The asset exposes its static arrays read-only, therefore
+    the fallback path copies them.  RTX has a separate GPU-DLPack update path and
+    does not use this helper for live CUDA-backed Gaussian data.
+    """
+    data = getattr(gaussian, "warp_data", None)
+    if data is not None and data.transforms is not None:
+        transforms = data.transforms.numpy().reshape(-1, 7)
+        return np.ascontiguousarray(transforms[:, 0:3]), np.ascontiguousarray(transforms[:, 3:7])
+    return (
+        np.array(gaussian.positions, dtype=np.float32, copy=True),
+        np.array(gaussian.rotations, dtype=np.float32, copy=True),
+    )
+
+
+def _gaussian_frame_scales(gaussian: newton.Gaussian) -> np.ndarray:
+    """Return the current per-axis Gaussian radii as writable host data."""
+    data = getattr(gaussian, "warp_data", None)
+    if data is not None and data.scales is not None:
+        return np.ascontiguousarray(data.scales.numpy())
+    return np.array(gaussian.scales, dtype=np.float32, copy=True)
+
+
 class ViewerUSD(ViewerBase):
     """
     USD viewer backend for Newton physics simulations.
@@ -163,6 +195,7 @@ class ViewerUSD(ViewerBase):
         layer._texture_paths: dict[str, str] = {}
         layer._mesh_appearance: dict[str, dict[str, Any]] = {}
         layer._instance_appearance: dict[str, dict[str, np.ndarray]] = {}
+        layer._gaussians = {}  # gaussian_name -> ParticleField3DGaussianSplat prim
 
     def _reset_stage(self):
         self.stage.GetRootLayer().Clear()
@@ -206,7 +239,13 @@ class ViewerUSD(ViewerBase):
                     pass
 
     def _remove_active_layer_prims(self):
-        names = set(self._meshes) | set(self._instance_groups) | set(self._instancers) | set(self._points)
+        names = (
+            set(self._meshes)
+            | set(self._instance_groups)
+            | set(self._instancers)
+            | set(self._points)
+            | set(self._gaussians)
+        )
         for name in sorted(names, key=lambda item: self._get_path(item).count("/"), reverse=True):
             if self._is_layer_owned_path(name):
                 self.stage.RemovePrim(self._get_path(name))
@@ -1017,6 +1056,97 @@ class ViewerUSD(ViewerBase):
 
         instancer.GetVisibilityAttr().Set("inherited" if not hidden else "invisible", self._frame_index)
         return instancer.GetPath()
+
+    @override
+    def log_gaussian(
+        self,
+        name: str,
+        gaussian: newton.Gaussian,
+        xform: wp.transformf | None = None,
+        hidden: bool = False,
+    ):
+        """Author a :class:`newton.Gaussian` as a ``ParticleField3DGaussianSplat`` prim.
+
+        That prim type, together with its ``positions``, ``orientations``,
+        ``scales``, ``opacities`` and ``radiance:sphericalHarmonicsCoefficients``
+        attributes, is what RTX renderers consume to ray-trace splats, so the
+        recorded stage carries the real Gaussian field rather than a stand-in
+        point cloud.
+
+        Positions and orientations are authored initially. Subsequent time
+        samples are opt-in through ``gaussian._newton_dynamic_attributes``;
+        a deformable sample can select positions, positions and orientations,
+        or positions, orientations, and scales. Opacities and radiance are
+        static and written once.
+
+        Args:
+            name: Unique path/name for the Gaussian field.
+            gaussian: The :class:`newton.Gaussian` asset to visualize.
+            xform: Optional world-space transform applied to all splat centers.
+            hidden: Whether the field should be hidden.
+
+        Returns:
+            ``Sdf.Path`` of the created/updated primitive.
+        """
+        name = self._qualify(name)
+        path = self._get_path(name)
+
+        is_new = name not in self._gaussians
+        if is_new:
+            self._ensure_scopes_for_path(self.stage, path)
+            prim = self.stage.DefinePrim(path, "ParticleField3DGaussianSplat")
+            prim.CreateAttribute("scales", Sdf.ValueTypeNames.Float3Array).Set(
+                Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(gaussian.scales, dtype=np.float32))
+            )
+            prim.CreateAttribute("opacities", Sdf.ValueTypeNames.FloatArray).Set(
+                Vt.FloatArray.FromNumpy(np.ascontiguousarray(gaussian.opacities, dtype=np.float32))
+            )
+            prim.CreateAttribute("radiance:sphericalHarmonicsDegree", Sdf.ValueTypeNames.Int).Set(gaussian.sh_degree)
+            # Coefficients are stored per splat as a flat run of scalars; USD groups
+            # them into one float3 (an RGB triplet) per coefficient.
+            prim.CreateAttribute("radiance:sphericalHarmonicsCoefficients", Sdf.ValueTypeNames.Float3Array).Set(
+                Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(gaussian.sh_coeffs, dtype=np.float32).reshape(-1, 3))
+            )
+            prim.CreateAttribute("positions", Sdf.ValueTypeNames.Point3fArray)
+            prim.CreateAttribute("orientations", Sdf.ValueTypeNames.QuatfArray)
+            _usd_add_xform(prim)
+            self._gaussians[name] = prim
+
+        prim = self._gaussians[name]
+
+        positions, orientations = _gaussian_frame_data(gaussian)
+        dynamic_attributes = tuple(getattr(gaussian, "_newton_dynamic_attributes", ()))
+        if "positions" in dynamic_attributes or is_new:
+            prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(positions), self._frame_index)
+        if "orientations" in dynamic_attributes or is_new:
+            prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(orientations), self._frame_index)
+        if "scales" in dynamic_attributes:
+            prim.GetAttribute("scales").Set(
+                Vt.Vec3fArray.FromNumpy(_gaussian_frame_scales(gaussian)), self._frame_index
+            )
+
+        if is_new and dynamic_attributes and getattr(self, "_ovrtx_animated_gaussians", False):
+            # OVRTX chooses static versus PreprocessedAnimatedGaussians while
+            # populating the USD stage.  Its Fabric scene sync classifies an
+            # attribute as animated from more than one USD time sample, not
+            # from a later bind_array_attribute() write.  Seed an identical
+            # next-frame sample for exactly the data the RTX viewer will
+            # stream, so the runtime GPU binding reaches the animated update
+            # path rather than destroying and recreating static geometry.
+            animation_time = self._frame_index + 1
+            if "positions" in dynamic_attributes:
+                prim.GetAttribute("positions").Set(Vt.Vec3fArray.FromNumpy(positions), animation_time)
+            if "orientations" in dynamic_attributes:
+                prim.GetAttribute("orientations").Set(Vt.QuatfArray.FromNumpy(orientations), animation_time)
+            if "scales" in dynamic_attributes:
+                prim.GetAttribute("scales").Set(
+                    Vt.Vec3fArray.FromNumpy(_gaussian_frame_scales(gaussian)), animation_time
+                )
+
+        if xform is not None:
+            _usd_set_xform(prim, pos=xform.p, rot=xform.q, time=self._frame_index)
+        UsdGeom.Imageable(prim).GetVisibilityAttr().Set("invisible" if hidden else "inherited", self._frame_index)
+        return prim.GetPath()
 
     @override
     def log_array(self, name: str, array: wp.array[Any] | np.ndarray):

@@ -90,6 +90,66 @@ class TestViewerUSD(unittest.TestCase):
         self.assertEqual(interpolation, UsdGeom.Tokens.vertex)
         np.testing.assert_allclose(display_color, colors.numpy(), atol=1e-6)
 
+    def test_log_gaussian_authors_native_splat_prim(self):
+        viewer = self._make_viewer()
+        gaussian = newton.Gaussian(
+            positions=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+            rotations=np.array([[0.1, 0.2, 0.3, 0.9]], dtype=np.float32),
+            scales=np.array([[0.4, 0.5, 0.6]], dtype=np.float32),
+            opacities=np.array([0.7], dtype=np.float32),
+            sh_coeffs=np.arange(48, dtype=np.float32).reshape(1, 48),
+        )
+
+        viewer.begin_frame(0.0)
+        path = viewer.log_gaussian("/gaussian", gaussian)
+        prim = viewer.stage.GetPrimAtPath(path)
+
+        self.assertEqual(prim.GetTypeName(), "ParticleField3DGaussianSplat")
+        np.testing.assert_allclose(
+            prim.GetAttribute("positions").Get(viewer._frame_index), gaussian.positions, atol=1.0e-6
+        )
+        np.testing.assert_allclose(prim.GetAttribute("scales").Get(), gaussian.scales, atol=1.0e-6)
+        np.testing.assert_allclose(prim.GetAttribute("opacities").Get(), gaussian.opacities, atol=1.0e-6)
+        np.testing.assert_allclose(
+            prim.GetAttribute("radiance:sphericalHarmonicsCoefficients").Get(),
+            gaussian.sh_coeffs.reshape(-1, 3),
+            atol=1.0e-6,
+        )
+        self.assertEqual(prim.GetAttribute("radiance:sphericalHarmonicsDegree").Get(), gaussian.sh_degree)
+        # A Gaussian is static unless its producer explicitly opts in to
+        # streaming.  In particular, recording it must not mark all Gaussian
+        # fields as animated in an RTX consumer.
+        self.assertEqual(prim.GetAttribute("positions").GetTimeSamples(), [viewer._frame_index])
+        self.assertEqual(prim.GetAttribute("orientations").GetTimeSamples(), [viewer._frame_index])
+
+        viewer.begin_frame(1.0 / 60.0)
+        viewer.log_gaussian("/gaussian", gaussian, hidden=True)
+        self.assertEqual(prim.GetAttribute("visibility").Get(viewer._frame_index), UsdGeom.Tokens.invisible)
+
+    def test_log_gaussian_can_seed_ovrtx_animation_classification(self):
+        viewer = self._make_viewer()
+        viewer._ovrtx_animated_gaussians = True
+        gaussian = newton.Gaussian(
+            positions=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+            rotations=np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+            scales=np.array([[0.4, 0.5, 0.6]], dtype=np.float32),
+            opacities=np.array([0.7], dtype=np.float32),
+            sh_coeffs=np.arange(48, dtype=np.float32).reshape(1, 48),
+        )
+        gaussian._newton_dynamic_attributes = ("positions",)
+
+        viewer.begin_frame(0.0)
+        path = viewer.log_gaussian("/gaussian", gaussian)
+        prim = viewer.stage.GetPrimAtPath(path)
+
+        # Kit classifies a ParticleField as animated from multiple USD samples
+        # during population. Only positions are dynamic in this configuration.
+        self.assertEqual(
+            prim.GetAttribute("positions").GetTimeSamples(), [viewer._frame_index, viewer._frame_index + 1]
+        )
+        self.assertEqual(prim.GetAttribute("orientations").GetTimeSamples(), [viewer._frame_index])
+        self.assertEqual(prim.GetAttribute("scales").GetTimeSamples(), [])
+
     def test_reuses_existing_layer_for_same_output_path(self):
         temp_file = tempfile.NamedTemporaryFile(suffix=".usda", delete=False)
         temp_file.close()

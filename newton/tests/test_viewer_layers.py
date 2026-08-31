@@ -77,6 +77,9 @@ class _MinimalRTXViewer(ViewerRTX):
         self._render_result = None
         self._render_products = None
         self._transform_binding = None
+        self._gaussian_bindings = {}
+        self._pending_gaussian_xforms = {}
+        self._pending_gaussian_visibility = {}
         self._rtx = None
         self._render_width = 640
         self._render_height = 480
