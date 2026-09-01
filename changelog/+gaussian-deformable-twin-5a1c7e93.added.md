@@ -12,9 +12,16 @@ center-and-rotation-and-scale visualization deformation. The scale mode uses
 the local deformation-gradient axis lengths, so it captures axial stretch but
 does not represent shear exactly.
 
-Use `--fast-simulation` for the interactive preset: four substeps and 30 VBD
+Use `--balanced-simulation` for an intermediate preset: eight substeps and 45
+VBD iterations per rendered frame, with a 12.5 Hz gripper drive. It offers a
+steadier grasp than the real-time preset at moderate cost. Use
+`--fast-simulation` for the interactive preset: four substeps and 30 VBD
 iterations per rendered frame, with a 7.5 Hz gripper drive, rather than the
 conservative elastic-wave substepping, 60 iterations, and 25 Hz drive. It is
 tuned to keep the packaged toy gripped and lifted while substantially reducing
 solver cost, but trades away accuracy for high-frequency material and contact
 response.
+
+Use `--no-gaussian-update` to hide the Gaussian field, skip its per-frame
+skinning and RTX update, and render the simulation TetMesh instead. This is a
+physics-only profiling mode.

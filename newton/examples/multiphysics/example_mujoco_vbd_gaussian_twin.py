@@ -78,12 +78,13 @@ IGNORE_PATHS = [".*VisualMesh"]
 
 # This scene's default is deliberately conservative: it resolves the elastic
 # wave travel time of every tetrahedron and runs enough VBD iterations for the
-# gripper contact to be close to converged.  The real-time preset instead
-# targets a responsive visual demonstration.  Its four 4.17 ms substeps still
-# resolve the grasp, while 30 iterations are the lowest count that kept the
-# packaged Bluehair toy in the jaws throughout the lift.  Its lower drive
-# bandwidth avoids the finger/contact limit cycle that the 25 Hz default
-# exhibits with this coarser solve.
+# gripper contact to be close to converged.  The balanced and real-time
+# presets trade some temporal and nonlinear-solve accuracy for interactive
+# cost. Their reduced drive bandwidth avoids the finger/contact limit cycle
+# that the 25 Hz default exhibits with a coarser solve.
+BALANCED_SIMULATION_SUBSTEPS = 8
+BALANCED_SIMULATION_VBD_ITERATIONS = 45
+BALANCED_SIMULATION_DRIVE_FREQUENCY = 12.5
 FAST_SIMULATION_SUBSTEPS = 4
 FAST_SIMULATION_VBD_ITERATIONS = 30
 FAST_SIMULATION_DRIVE_FREQUENCY = 7.5
@@ -514,6 +515,8 @@ class GaussianTwin:
 class Example:
     def __init__(self, viewer, args):
         newton.use_coord_layout_targets = True
+        if args.fast_simulation and args.balanced_simulation:
+            raise ValueError("--fast-simulation and --balanced-simulation are mutually exclusive.")
         if args.fast_simulation:
             # Keep the material and contact gains intact.  Reducing them makes
             # the toy cheaper but also changes the demonstration into one
@@ -523,6 +526,14 @@ class Example:
             args.substeps = FAST_SIMULATION_SUBSTEPS
             args.vbd_iterations = FAST_SIMULATION_VBD_ITERATIONS
             args.drive_frequency = FAST_SIMULATION_DRIVE_FREQUENCY
+        elif args.balanced_simulation:
+            # The midpoint preset retains twice the fast preset's temporal
+            # resolution and 50% more nonlinear iterations. It is intended
+            # for a visibly steadier grasp when the full conservative solve is
+            # unnecessary, while its lower drive bandwidth remains resolvable.
+            args.substeps = BALANCED_SIMULATION_SUBSTEPS
+            args.vbd_iterations = BALANCED_SIMULATION_VBD_ITERATIONS
+            args.drive_frequency = BALANCED_SIMULATION_DRIVE_FREQUENCY
         self.args = args
         self.viewer = viewer
         self.scene = args.scene
@@ -733,18 +744,23 @@ class Example:
         self.control = self.model.control()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        self.twin = GaussianTwin(
-            binding,
-            self.model.shape_source[gaussian_shape],
-            asset_linear,
-            asset_translation,
-            asset_rotation,
-            wp.clone(self.state_0.particle_q),
-            args.splat_deformation,
-        )
-        self.twin.update(self.state_0)
+        self.gaussian_updates_enabled = not args.no_gaussian_update
+        self.twin = None
+        if self.gaussian_updates_enabled:
+            self.twin = GaussianTwin(
+                binding,
+                self.model.shape_source[gaussian_shape],
+                asset_linear,
+                asset_translation,
+                asset_rotation,
+                wp.clone(self.state_0.particle_q),
+                args.splat_deformation,
+            )
+            self.twin.update(self.state_0)
         self.initial_tet_center = np.mean(self.state_0.particle_q.numpy(), axis=0)
-        self.initial_gaussian_center = np.mean(self.twin.transforms.numpy()[:, 0:3], axis=0)
+        self.initial_gaussian_center = (
+            np.mean(self.twin.transforms.numpy()[:, 0:3], axis=0) if self.twin is not None else None
+        )
 
         target_q_start = self.model.joint_target_q_start.numpy()
         self.lift_target = int(target_q_start[self.lift_joint])
@@ -752,6 +768,11 @@ class Example:
         self.finger_targets = (int(target_q_start[self.left_joint]), int(target_q_start[self.right_joint]))
         self.max_toy_swing = 0.0
 
+        # Set this before set_model() enters the RTX build phase. The viewer
+        # still receives the Gaussian shape as part of the model, but leaves
+        # it hidden and never schedules per-frame Fabric writes.
+        if not self.gaussian_updates_enabled and hasattr(self.viewer, "show_gaussians"):
+            self.viewer.show_gaussians = False
         newton.examples.configure_coupled_view(self, args)
         # Only some backends draw Gaussian assets; ``log_gaussian`` is a no-op in the
         # base viewer. Without it the toy would be invisible, so fall back to the
@@ -759,20 +780,28 @@ class Example:
         # Viser's Gaussian API currently caches its immutable asset positions,
         # so it cannot visualize this field's per-frame skinning correctly.
         # Use the live tetmesh fallback there rather than showing a static twin.
-        splats_supported = type(self.viewer).log_gaussian is not ViewerBase.log_gaussian and not isinstance(
-            self.viewer, ViewerViser
+        splats_supported = (
+            self.gaussian_updates_enabled
+            and type(self.viewer).log_gaussian is not ViewerBase.log_gaussian
+            and not isinstance(self.viewer, ViewerViser)
         )
         if not splats_supported and not args.quiet:
+            detail = (
+                "Gaussian updates are disabled"
+                if not self.gaussian_updates_enabled
+                else f"{type(self.viewer).__name__} cannot render Gaussian splats"
+            )
             print(
-                f"{type(self.viewer).__name__} cannot render Gaussian splats; showing the simulation "
-                "mesh instead. Run with '--viewer gl' or '--viewer rtx' to see the Gaussian twin."
+                f"{detail}; showing the simulation mesh instead. "
+                "Run with '--viewer gl' or '--viewer rtx' without '--no-gaussian-update' to see the Gaussian twin."
             )
         if hasattr(self.viewer, "show_gaussians"):
             # The visible appearance is meant to come from the splats alone, so the tet
             # mesh surface stays hidden unless it is asked for or nothing else would show.
             self.viewer.show_gaussians = splats_supported
             self.viewer.show_triangles = args.show_tetmesh or not splats_supported
-            self.viewer.gaussians_max_points = max(self.viewer.gaussians_max_points, len(self.twin.transforms))
+            if self.twin is not None:
+                self.viewer.gaussians_max_points = max(self.viewer.gaussians_max_points, len(self.twin.transforms))
         if hasattr(self.viewer, "set_camera"):
             length = self.toy_length
             self.viewer.set_camera(wp.vec3(1.4 * length, -1.7 * length, 0.9 * length), -18.0, 130.0)
@@ -921,7 +950,8 @@ class Example:
                 wp.capture_launch(self.graph)
         else:
             self.simulate()
-        self.twin.update(self.state_0)
+        if self.twin is not None:
+            self.twin.update(self.state_0)
         # This validation is only needed by the test harness.  ``numpy()`` is a
         # device-wide synchronization and copying all particles every interactive
         # frame prevents simulation and rendering from overlapping.
@@ -966,13 +996,14 @@ class Example:
                 f"Carriage did not swing the toy: max dx={self.max_toy_swing:.4f}"
             )
 
-        gaussian_q = self.twin.transforms.numpy()[:, 0:3]
-        assert np.isfinite(gaussian_q).all(), "Gaussian field contains non-finite positions"
-        # The skinned field must follow the simulation mesh it is bound to. The two
-        # centers are not identical (the field extends past the mesh where the baked
-        # weights extrapolate), so compare how far each has travelled.
-        drift = np.linalg.norm(np.mean(gaussian_q, axis=0) - self.initial_gaussian_center - tet_shift)
-        assert drift < 0.15 * length, f"Gaussian field did not follow the simulation mesh: drift={drift:.4f}"
+        if self.twin is not None:
+            gaussian_q = self.twin.transforms.numpy()[:, 0:3]
+            assert np.isfinite(gaussian_q).all(), "Gaussian field contains non-finite positions"
+            # The skinned field must follow the simulation mesh it is bound to. The two
+            # centers are not identical (the field extends past the mesh where the baked
+            # weights extrapolate), so compare how far each has travelled.
+            drift = np.linalg.norm(np.mean(gaussian_q, axis=0) - self.initial_gaussian_center - tet_shift)
+            assert drift < 0.15 * length, f"Gaussian field did not follow the simulation mesh: drift={drift:.4f}"
 
     @staticmethod
     def create_parser():
@@ -1011,6 +1042,16 @@ class Example:
             "It reduces the default solver work by roughly 10x and preserves the packaged toy's grasp/lift "
             "demonstration, but is less accurate for stiff material waves and contact forces. This preset "
             "intentionally overrides --substeps, --vbd-iterations, and --drive-frequency.",
+        )
+        parser.add_argument(
+            "--balanced-simulation",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Use the balanced Gaussian-twin preset (8 substeps x 45 VBD iterations and a 12.5 Hz "
+            "gripper drive per rendered frame). It sits between the conservative default and "
+            "--fast-simulation: steadier grasp/contact behavior than the fast preset at about three times its "
+            "solver work. This preset intentionally overrides --substeps, --vbd-iterations, and "
+            "--drive-frequency; it cannot be combined with --fast-simulation.",
         )
         parser.add_argument("--density", type=float, default=300.0, help="Toy density [kg/m^3].")
         parser.add_argument(
@@ -1110,6 +1151,12 @@ class Example:
             help="Gaussian attributes deformed from the tet mesh: centers only, centers plus orientation, or "
             "centers plus orientation and per-axis scale. Scale deformation approximates stretch but cannot "
             "represent shear.",
+        )
+        parser.add_argument(
+            "--no-gaussian-update",
+            action="store_true",
+            help="Disable Gaussian skinning and RTX Gaussian streaming, and show the simulation tetmesh instead. "
+            "Use this to measure physics without per-frame Gaussian update or rendering cost.",
         )
         return parser
 

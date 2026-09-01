@@ -233,6 +233,9 @@ class ViewerRTX(ViewerUSD):
         self._render_products = None
         self._uses_fractional_opacity = False
         self._transform_binding = None
+        self._transform_buffers = None
+        self._transform_buffer_index = 0
+        self._transform_write_operations = [None, None]
         self._blit_frame_copy: wp.array | None = None
         self._gaussian_bindings = {}
         self._pending_gaussian_xforms = {}
@@ -769,6 +772,11 @@ void main() {
 
             config = ovrtx.RendererConfig()
             config.log_level = "error"
+            # OVRTX owns an embedded Carbonite framework. Opt in before its
+            # first renderer is created to make that framework load Kit's
+            # Tracy profiler backend; an external Tracy client can then attach
+            # to this Newton process.
+            config.enable_profiling = os.environ.get("NEWTON_RTX_TRACY", "").lower() in {"1", "true", "yes"}
             self._rtx = ovrtx.Renderer(config=config)
             self._rtx.open_usd(ovrtx_usd_path)
 
@@ -786,6 +794,16 @@ void main() {
                     semantic=Semantic.XFORM_MAT4x4,
                     prim_mode=PrimMode.MUST_EXIST,
                 )
+                # Own the GPU memory used for transform updates. Mapping an
+                # OVRTX-owned buffer and unmapping it per frame releases that
+                # buffer through cudaFree in OVRTX 0.4, which synchronizes the
+                # complete device. Two owned buffers allow the renderer to
+                # consume one while Newton writes the other.
+                self._transform_buffers = tuple(
+                    wp.empty(len(self._all_instance_paths), dtype=wp.mat44d, device=self.device) for _ in range(2)
+                )
+                self._transform_buffer_index = 0
+                self._transform_write_operations = [None, None]
         except Exception as e:
             raise RuntimeError(f"Failed to create OVRTX renderer: {e}") from e
         finally:
@@ -1806,52 +1824,75 @@ void main() {
         if not self._transform_binding or (not has_flat_shape_arrays and not self._pending_xforms):
             return
         with wp.ScopedTimer("ViewerRTX::update_transforms", active=PROFILE_ENABLED, use_nvtx=NVTX_ENABLED):
-            from ovrtx import Device
+            from ovrtx import DataAccess
 
-            rtx_device = Device.CUDA if self.device.is_cuda else Device.CPU
-            with self._transform_binding.map(device=rtx_device) as mapping:
-                matrices = wp.from_dlpack(mapping.tensor, dtype=wp.mat44d)  # (N, 4, 4) float64
+            # Wait only before reusing this caller-owned buffer. OVRTX's async
+            # write retains the buffer until this operation completes.
+            buffer_index = self._transform_buffer_index
+            previous_operation = self._transform_write_operations[buffer_index]
+            if previous_operation is not None:
+                previous_operation.wait()
+            matrices = self._transform_buffers[buffer_index]
 
-                body_q = self._last_state.body_q if self._last_state is not None else None
-                world_offsets = self.world_offsets
+            body_q = self._last_state.body_q if self._last_state is not None else None
+            world_offsets = self.world_offsets
 
-                if has_flat_shape_arrays:
-                    # Single kernel launch for all shape batches.
-                    wp.launch(
-                        update_and_write_shape_transforms,
-                        dim=self._flat_total_shapes,
-                        inputs=[
-                            self._flat_shape_xforms,
-                            self._flat_shape_parents,
-                            body_q,
-                            self._flat_shape_worlds,
-                            world_offsets,
-                            self.layer.xform,
-                            self._flat_shape_scales,
-                            self._flat_mat44_offset,
-                            matrices,
-                        ],
-                        device=matrices.device,
-                    )
+            if has_flat_shape_arrays:
+                # Single kernel launch for all shape batches.
+                wp.launch(
+                    update_and_write_shape_transforms,
+                    dim=self._flat_total_shapes,
+                    inputs=[
+                        self._flat_shape_xforms,
+                        self._flat_shape_parents,
+                        body_q,
+                        self._flat_shape_worlds,
+                        world_offsets,
+                        self.layer.xform,
+                        self._flat_shape_scales,
+                        self._flat_mat44_offset,
+                        matrices,
+                    ],
+                    device=matrices.device,
+                )
 
-                # Handle any remaining pre-computed transforms (e.g. picking line).
-                if self._pending_xforms:
-                    offset = 0
-                    for name, paths in self._instance_prim_paths.items():
-                        count = len(paths)
-                        if name in self._pending_xforms:
-                            xf, sc = self._pending_xforms[name]
-                            n = min(count, len(xf))
-                            wp.launch(
-                                write_transforms,
-                                dim=n,
-                                inputs=[xf, sc, offset, matrices],
-                                device=matrices.device,
-                            )
-                        offset += count
+            # Handle any remaining pre-computed transforms (e.g. picking line).
+            if self._pending_xforms:
+                offset = 0
+                for name, paths in self._instance_prim_paths.items():
+                    count = len(paths)
+                    if name in self._pending_xforms:
+                        xf, sc = self._pending_xforms[name]
+                        n = min(count, len(xf))
+                        wp.launch(
+                            write_transforms,
+                            dim=n,
+                            inputs=[xf, sc, offset, matrices],
+                            device=matrices.device,
+                        )
+                    offset += count
 
-                if matrices.device.is_cuda:
-                    mapping.unmap(stream=matrices.device.stream.cuda_stream)
+            if matrices.device.is_cuda:
+                self._transform_write_operations[buffer_index] = self._transform_binding.write_async(
+                    matrices,
+                    data_access=DataAccess.ASYNC,
+                    cuda_stream=wp.get_stream(matrices.device).cuda_stream,
+                )
+                self._transform_buffer_index = (buffer_index + 1) % len(self._transform_buffers)
+            else:
+                self._transform_binding.write(matrices)
+
+    def _release_transform_binding(self):
+        """Release the transform binding after its asynchronous writes complete."""
+        for operation in self._transform_write_operations:
+            if operation is not None:
+                operation.wait()
+        if self._transform_binding is not None:
+            self._transform_binding.unbind()
+        self._transform_binding = None
+        self._transform_buffers = None
+        self._transform_buffer_index = 0
+        self._transform_write_operations = [None, None]
 
     def _update_ovrtx_instance_visibility(self):
         if self._rtx is None or not self._pending_instance_visibility:
@@ -2441,9 +2482,7 @@ void main() {
         self._render_products = None
 
         # Release OVRTX resources
-        if self._transform_binding is not None:
-            self._transform_binding.unbind()
-            self._transform_binding = None
+        self._release_transform_binding()
         self._release_gaussian_bindings()
 
         # Release OVRTX renderer
@@ -2617,9 +2656,7 @@ void main() {
         self._render_products = None
 
         # release transform binding
-        if self._transform_binding is not None:
-            self._transform_binding.unbind()
-            self._transform_binding = None
+        self._release_transform_binding()
         self._release_gaussian_bindings()
 
         # release ovrtx renderer
